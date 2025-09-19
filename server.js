@@ -9,15 +9,16 @@ const app = express();
 /* ---------------- CONFIG ---------------- */
 const PORT = process.env.PORT || 8080;
 
-// Optional sanity check (won't block if mismatched, just warns)
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // e.g. "0d1f5365-a01e-4af4-b240-0fd0db2631ae"
+// Optional: lock to your assistant ID (warn-only)
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // "0d1f5365-a01e-4af4-b240-0fd0db2631ae"
 
-// FIX 1: Secret set in Vapi (Assistant → Advanced → Server URL → Secret)
-// Leave HTTP Headers empty in Vapi. This server verifies X-Vapi-Signature.
-// (Also accepts X-Vapi-Secret if you accidentally use a header credential.)
+// Your Vapi Assistant → Advanced → Server URL → Secret (leave HTTP Headers blank)
 const VAPI_SERVER_SECRET = process.env.VAPI_SERVER_SECRET;
 
-// HubSpot Private App token (scopes: contacts/deals/notes write)
+// Set STRICT_SIGNATURE=false while debugging if Vapi says "can't connect to hook"
+const STRICT_SIGNATURE = (process.env.STRICT_SIGNATURE ?? "true").toLowerCase() === "true";
+
+// HubSpot Private App token (contacts/deals/notes write scopes)
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 
 /* ---------------- MIDDLEWARE ---------------- */
@@ -27,13 +28,12 @@ app.use(express.json({ limit: "1mb" }));
 
 /* ---------------- HELPERS ---------------- */
 function verifyVapi(req) {
-  // Prefer X-Vapi-Signature (Secret box). Also accept X-Vapi-Secret (header credential).
+  // Prefer X-Vapi-Signature (Secret field). Also accept X-Vapi-Secret (header credential).
   const hSig = req.header("X-Vapi-Signature");
   const hLegacy = req.header("X-Vapi-Secret");
-
   if (!VAPI_SERVER_SECRET) {
     console.warn("WARNING: VAPI_SERVER_SECRET not set; skipping signature verification.");
-    return true; // flip to false to hard-enforce
+    return true; // flip to false to hard-enforce even without env var
   }
   return (hSig && hSig === VAPI_SERVER_SECRET) || (hLegacy && hLegacy === VAPI_SERVER_SECRET);
 }
@@ -43,9 +43,8 @@ function ensureAssistantOk(message) {
   const incoming = message?.assistantId || message?.assistant_id || "";
   if (incoming && incoming !== VAPI_ASSISTANT_ID) {
     console.warn(`AssistantId mismatch. Expected ${VAPI_ASSISTANT_ID}, got ${incoming}`);
-    // return false to hard-enforce; warn-only to avoid blocking tests
   }
-  return true;
+  return true; // warn-only
 }
 
 const hs = axios.create({
@@ -59,7 +58,6 @@ const hs = axios.create({
 
 /* ---------------- HUBSPOT HELPERS ---------------- */
 
-// Search contact by email (preferred unique key)
 async function findContactIdByEmail(email) {
   if (!email) return null;
   try {
@@ -75,7 +73,6 @@ async function findContactIdByEmail(email) {
   }
 }
 
-// Create or update contact
 async function upsertContact(args) {
   const {
     email,
@@ -84,7 +81,6 @@ async function upsertContact(args) {
     lastname,
     lifecyclestage,
     source,
-    // Optional address fields you might pass from Ellie:
     propertyAddress,
     propertyCity,
     propertyState,
@@ -99,7 +95,7 @@ async function upsertContact(args) {
   if (lifecyclestage) properties.lifecyclestage = lifecyclestage;
   if (source) properties.source = source;
 
-  // Map optional address fields to HubSpot defaults (adjust if you use custom props)
+  // map optional address fields to default HS props (adjust if you use custom ones)
   if (propertyAddress) properties.address = propertyAddress;
   if (propertyCity) properties.city = propertyCity;
   if (propertyState) properties.state = propertyState;
@@ -116,17 +112,8 @@ async function upsertContact(args) {
   }
 }
 
-// Create deal & optionally associate to a contact
 async function createDeal(args) {
-  const {
-    dealname,
-    amount,
-    pipeline,
-    dealstage,
-    close_date,
-    associated_contact_id
-  } = args || {};
-
+  const { dealname, amount, pipeline, dealstage, close_date, associated_contact_id } = args || {};
   const props = { dealname };
   if (amount != null) props.amount = String(amount);
   if (pipeline) props.pipeline = pipeline;
@@ -148,7 +135,6 @@ async function createDeal(args) {
   return { id: dealId };
 }
 
-// Create note & optionally associate to a contact
 async function createNote(args) {
   const { contact_id, note } = args || {};
   const tsIso = new Date().toISOString();
@@ -172,25 +158,45 @@ async function createNote(args) {
 
 /* ---------------- ROUTES ---------------- */
 
-// Simple health endpoints
 app.get("/", (_req, res) => res.status(200).send("Vapi ↔ HubSpot bridge is up"));
+
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     assistantIdEnforced: !!VAPI_ASSISTANT_ID,
     hasHubSpotToken: !!HUBSPOT_TOKEN,
     signatureRequired: !!VAPI_SERVER_SECRET,
+    strictSignature: STRICT_SIGNATURE,
     now: new Date().toISOString()
   });
 });
 
-// Main webhook Vapi calls (Assistant → Advanced → Server URL)
 app.post("/webhook", async (req, res) => {
   try {
-    if (!verifyVapi(req)) return res.status(403).json({ error: "Invalid signature" });
+    // Helpful debug log (safe; no bodies)
+    console.log("POST /webhook", {
+      headers: {
+        hasSig: !!req.header("X-Vapi-Signature"),
+        hasLegacy: !!req.header("X-Vapi-Secret"),
+        contentType: req.header("content-type")
+      }
+    });
+
+    const okSig = verifyVapi(req);
+    if (!okSig) {
+      console.warn("Invalid signature");
+      if (STRICT_SIGNATURE) {
+        return res.status(403).json({ error: "Invalid signature" });
+      } else {
+        // Soft-fail to keep Vapi “connected” during setup
+        return res.status(200).json({ results: [{ error: "Invalid signature" }] });
+      }
+    }
 
     const message = req.body?.message || req.body || {};
-    if (!ensureAssistantOk(message)) return res.status(404).json({ error: "Assistant mismatch" });
+    if (!ensureAssistantOk(message)) {
+      return res.status(404).json({ error: "Assistant mismatch" });
+    }
 
     const toolCalls = message.toolCalls || [];
     const results = [];
@@ -203,29 +209,25 @@ app.post("/webhook", async (req, res) => {
       let result;
 
       try {
-        // FIX 2: alias support for your prompt tool names
         switch (name) {
-          // Contacts
+          // Canonical names + aliases to match your prompt/tools
           case "create_or_update_hubspot_contact":
-          case "create_or_update_contact": // alias from your prompt
+          case "create_or_update_contact":
             result = await upsertContact(args);
             break;
 
-          // Deals
           case "create_hubspot_deal":
-          case "create_deal": // alias
+          case "create_deal":
             result = await createDeal(args);
             break;
 
-          // Notes
           case "log_hubspot_note":
-          case "log_note": // alias from your prompt
+          case "log_note":
             result = await createNote(args);
             break;
 
-          // Scheduling (placeholder)
           case "schedule_meeting_placeholder":
-          case "schedule_followup": // alias (returns a link for now)
+          case "schedule_followup":
             result = {
               scheduled: true,
               url: "https://calendly.com/pg-taylorrealestategroups/30min",
@@ -233,7 +235,7 @@ app.post("/webhook", async (req, res) => {
             };
             break;
 
-          // Not implemented yet—return OK so the convo doesn't crash
+          // Not wired yet—don’t crash the call
           case "set_lead_status":
           case "mark_dnc":
           case "remove_number_from_contact":
@@ -253,8 +255,7 @@ app.post("/webhook", async (req, res) => {
       results.push({ toolCallId: callId, result });
     }
 
-    // Always return { results: [...] } with 200
-    return res.json({ results });
+    return res.json({ results }); // Always 200 with results array
   } catch (err) {
     console.error("Webhook error:", err?.response?.data || err.message);
     return res.status(200).json({ results: [{ error: "Server error", detail: String(err.message || err) }] });
