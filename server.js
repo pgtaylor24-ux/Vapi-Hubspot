@@ -6,34 +6,36 @@ import axios from "axios";
 
 const app = express();
 
-// ---------- Config ----------
+/* ---------------- CONFIG ---------------- */
 const PORT = process.env.PORT || 8080;
 
-// Optional: lock to your assistant ID for sanity
+// Optional sanity check (won't block if mismatched, just warns)
 const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // e.g. "0d1f5365-a01e-4af4-b240-0fd0db2631ae"
 
-// Secret you configure in Vapi (either Server URL → Secret -> X-Vapi-Signature,
-// or Custom Credential/header -> X-Vapi-Secret). Must match VAPI_SERVER_SECRET.
+// FIX 1: Secret set in Vapi (Assistant → Advanced → Server URL → Secret)
+// Leave HTTP Headers empty in Vapi. This server verifies X-Vapi-Signature.
+// (Also accepts X-Vapi-Secret if you accidentally use a header credential.)
 const VAPI_SERVER_SECRET = process.env.VAPI_SERVER_SECRET;
 
 // HubSpot Private App token (scopes: contacts/deals/notes write)
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 
-// ---------- Middleware ----------
+/* ---------------- MIDDLEWARE ---------------- */
 app.use(cors());
 app.use(morgan("dev"));
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- Helpers ----------
+/* ---------------- HELPERS ---------------- */
 function verifyVapi(req) {
-  // Accept either header—use whichever you configure in Vapi.
-  const h1 = req.header("X-Vapi-Signature");
-  const h2 = req.header("X-Vapi-Secret");
+  // Prefer X-Vapi-Signature (Secret box). Also accept X-Vapi-Secret (header credential).
+  const hSig = req.header("X-Vapi-Signature");
+  const hLegacy = req.header("X-Vapi-Secret");
+
   if (!VAPI_SERVER_SECRET) {
     console.warn("WARNING: VAPI_SERVER_SECRET not set; skipping signature verification.");
-    return true; // change to false to hard-enforce
+    return true; // flip to false to hard-enforce
   }
-  return (h1 && h1 === VAPI_SERVER_SECRET) || (h2 && h2 === VAPI_SERVER_SECRET);
+  return (hSig && hSig === VAPI_SERVER_SECRET) || (hLegacy && hLegacy === VAPI_SERVER_SECRET);
 }
 
 function ensureAssistantOk(message) {
@@ -41,7 +43,7 @@ function ensureAssistantOk(message) {
   const incoming = message?.assistantId || message?.assistant_id || "";
   if (incoming && incoming !== VAPI_ASSISTANT_ID) {
     console.warn(`AssistantId mismatch. Expected ${VAPI_ASSISTANT_ID}, got ${incoming}`);
-    // return false to block; warn-only for now
+    // return false to hard-enforce; warn-only to avoid blocking tests
   }
   return true;
 }
@@ -55,7 +57,9 @@ const hs = axios.create({
   timeout: 15000
 });
 
-// --- HubSpot: find contact by email ---
+/* ---------------- HUBSPOT HELPERS ---------------- */
+
+// Search contact by email (preferred unique key)
 async function findContactIdByEmail(email) {
   if (!email) return null;
   try {
@@ -71,8 +75,22 @@ async function findContactIdByEmail(email) {
   }
 }
 
-// --- HubSpot: upsert contact ---
-async function upsertContact({ email, phone, firstname, lastname, lifecyclestage, source }) {
+// Create or update contact
+async function upsertContact(args) {
+  const {
+    email,
+    phone,
+    firstname,
+    lastname,
+    lifecyclestage,
+    source,
+    // Optional address fields you might pass from Ellie:
+    propertyAddress,
+    propertyCity,
+    propertyState,
+    propertyZip
+  } = args || {};
+
   const properties = {};
   if (email) properties.email = email;
   if (phone) properties.phone = phone;
@@ -80,6 +98,12 @@ async function upsertContact({ email, phone, firstname, lastname, lifecyclestage
   if (lastname) properties.lastname = lastname;
   if (lifecyclestage) properties.lifecyclestage = lifecyclestage;
   if (source) properties.source = source;
+
+  // Map optional address fields to HubSpot defaults (adjust if you use custom props)
+  if (propertyAddress) properties.address = propertyAddress;
+  if (propertyCity) properties.city = propertyCity;
+  if (propertyState) properties.state = propertyState;
+  if (propertyZip) properties.zip = propertyZip;
 
   let contactId = await findContactIdByEmail(email);
 
@@ -92,8 +116,17 @@ async function upsertContact({ email, phone, firstname, lastname, lifecyclestage
   }
 }
 
-// --- HubSpot: create deal & associate to contact (optional) ---
-async function createDeal({ dealname, amount, pipeline, dealstage, close_date, associated_contact_id }) {
+// Create deal & optionally associate to a contact
+async function createDeal(args) {
+  const {
+    dealname,
+    amount,
+    pipeline,
+    dealstage,
+    close_date,
+    associated_contact_id
+  } = args || {};
+
   const props = { dealname };
   if (amount != null) props.amount = String(amount);
   if (pipeline) props.pipeline = pipeline;
@@ -115,9 +148,11 @@ async function createDeal({ dealname, amount, pipeline, dealstage, close_date, a
   return { id: dealId };
 }
 
-// --- HubSpot: create note & associate to contact (optional) ---
-async function createNote({ contact_id, note }) {
+// Create note & optionally associate to a contact
+async function createNote(args) {
+  const { contact_id, note } = args || {};
   const tsIso = new Date().toISOString();
+
   const { data } = await hs.post(`/crm/v3/objects/notes`, {
     properties: { hs_timestamp: tsIso, hs_note_body: note }
   });
@@ -125,7 +160,7 @@ async function createNote({ contact_id, note }) {
 
   if (contact_id) {
     try {
-      // v3 snake-case association type id
+      // v3 association type id
       await hs.put(`/crm/v3/objects/notes/${noteId}/associations/contact/${contact_id}/note_to_contact`);
     } catch (e) {
       console.error("Associate note->contact failed:", e?.response?.data || e.message);
@@ -135,9 +170,10 @@ async function createNote({ contact_id, note }) {
   return { id: noteId };
 }
 
-// ---------- Routes ----------
-app.get("/", (_req, res) => res.status(200).send("Vapi ↔ HubSpot bridge is up"));
+/* ---------------- ROUTES ---------------- */
 
+// Simple health endpoints
+app.get("/", (_req, res) => res.status(200).send("Vapi ↔ HubSpot bridge is up"));
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -167,23 +203,45 @@ app.post("/webhook", async (req, res) => {
       let result;
 
       try {
+        // FIX 2: alias support for your prompt tool names
         switch (name) {
+          // Contacts
           case "create_or_update_hubspot_contact":
+          case "create_or_update_contact": // alias from your prompt
             result = await upsertContact(args);
             break;
+
+          // Deals
           case "create_hubspot_deal":
+          case "create_deal": // alias
             result = await createDeal(args);
             break;
+
+          // Notes
           case "log_hubspot_note":
+          case "log_note": // alias from your prompt
             result = await createNote(args);
             break;
+
+          // Scheduling (placeholder)
           case "schedule_meeting_placeholder":
+          case "schedule_followup": // alias (returns a link for now)
             result = {
               scheduled: true,
               url: "https://calendly.com/pg-taylorrealestategroups/30min",
               info: "Placeholder; replace with real scheduler later."
             };
             break;
+
+          // Not implemented yet—return OK so the convo doesn't crash
+          case "set_lead_status":
+          case "mark_dnc":
+          case "remove_number_from_contact":
+          case "live_transfer":
+          case "send_sms":
+            result = { ok: true, info: `${name} not wired yet; ignoring.` };
+            break;
+
           default:
             result = { error: `Unknown tool: ${name}` };
         }
@@ -195,14 +253,15 @@ app.post("/webhook", async (req, res) => {
       results.push({ toolCallId: callId, result });
     }
 
-    return res.json({ results }); // Always 200 with results array
+    // Always return { results: [...] } with 200
+    return res.json({ results });
   } catch (err) {
     console.error("Webhook error:", err?.response?.data || err.message);
     return res.status(200).json({ results: [{ error: "Server error", detail: String(err.message || err) }] });
   }
 });
 
-// ---------- Start ----------
+/* ---------------- START ---------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
   if (!VAPI_SERVER_SECRET) console.warn("WARNING: VAPI_SERVER_SECRET not set");
