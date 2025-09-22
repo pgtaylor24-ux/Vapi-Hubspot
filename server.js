@@ -1,4 +1,5 @@
 // server.js
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -9,13 +10,13 @@ const app = express();
 /* ---------------- CONFIG ---------------- */
 const PORT = process.env.PORT || 8080;
 
-// Optional: lock to your assistant ID (warn-only)
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // "0d1f5365-a01e-4af4-b240-0fd0db2631ae"
+// Optional: lock to your assistant (warn-only)
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // e.g. "0d1f5365-a01e-4af4-b240-0fd0db2631ae"
 
-// Your Vapi Assistant → Advanced → Server URL → Secret (leave HTTP Headers blank)
+// Vapi Assistant → Advanced → Server URL → Secret (leave headers empty)
 const VAPI_SERVER_SECRET = process.env.VAPI_SERVER_SECRET;
 
-// Set STRICT_SIGNATURE=false while debugging if Vapi says "can't connect to hook"
+// Strict signature check (set STRICT_SIGNATURE=false while debugging)
 const STRICT_SIGNATURE = (process.env.STRICT_SIGNATURE ?? "true").toLowerCase() === "true";
 
 // HubSpot Private App token (contacts/deals/notes write scopes)
@@ -28,12 +29,11 @@ app.use(express.json({ limit: "1mb" }));
 
 /* ---------------- HELPERS ---------------- */
 function verifyVapi(req) {
-  // Prefer X-Vapi-Signature (Secret field). Also accept X-Vapi-Secret (header credential).
   const hSig = req.header("X-Vapi-Signature");
-  const hLegacy = req.header("X-Vapi-Secret");
+  const hLegacy = req.header("X-Vapi-Secret"); // accepted for header-credential setups
   if (!VAPI_SERVER_SECRET) {
     console.warn("WARNING: VAPI_SERVER_SECRET not set; skipping signature verification.");
-    return true; // flip to false to hard-enforce even without env var
+    return true;
   }
   return (hSig && hSig === VAPI_SERVER_SECRET) || (hLegacy && hLegacy === VAPI_SERVER_SECRET);
 }
@@ -57,7 +57,6 @@ const hs = axios.create({
 });
 
 /* ---------------- HUBSPOT HELPERS ---------------- */
-
 async function findContactIdByEmail(email) {
   if (!email) return null;
   try {
@@ -75,16 +74,8 @@ async function findContactIdByEmail(email) {
 
 async function upsertContact(args) {
   const {
-    email,
-    phone,
-    firstname,
-    lastname,
-    lifecyclestage,
-    source,
-    propertyAddress,
-    propertyCity,
-    propertyState,
-    propertyZip
+    email, phone, firstname, lastname, lifecyclestage, source,
+    propertyAddress, propertyCity, propertyState, propertyZip
   } = args || {};
 
   const properties = {};
@@ -95,14 +86,13 @@ async function upsertContact(args) {
   if (lifecyclestage) properties.lifecyclestage = lifecyclestage;
   if (source) properties.source = source;
 
-  // map optional address fields to default HS props (adjust if you use custom ones)
+  // map to default HS props (adjust if you use custom ones)
   if (propertyAddress) properties.address = propertyAddress;
   if (propertyCity) properties.city = propertyCity;
   if (propertyState) properties.state = propertyState;
   if (propertyZip) properties.zip = propertyZip;
 
   let contactId = await findContactIdByEmail(email);
-
   if (contactId) {
     await hs.patch(`/crm/v3/objects/contacts/${contactId}`, { properties });
     return { id: contactId, updated: true };
@@ -131,7 +121,6 @@ async function createDeal(args) {
       console.error("Associate deal->contact failed:", e?.response?.data || e.message);
     }
   }
-
   return { id: dealId };
 }
 
@@ -146,20 +135,16 @@ async function createNote(args) {
 
   if (contact_id) {
     try {
-      // v3 association type id
       await hs.put(`/crm/v3/objects/notes/${noteId}/associations/contact/${contact_id}/note_to_contact`);
     } catch (e) {
       console.error("Associate note->contact failed:", e?.response?.data || e.message);
     }
   }
-
   return { id: noteId };
 }
 
 /* ---------------- ROUTES ---------------- */
-
 app.get("/", (_req, res) => res.status(200).send("Vapi ↔ HubSpot bridge is up"));
-
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -173,30 +158,22 @@ app.get("/health", (_req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
-    // Helpful debug log (safe; no bodies)
     console.log("POST /webhook", {
-      headers: {
-        hasSig: !!req.header("X-Vapi-Signature"),
-        hasLegacy: !!req.header("X-Vapi-Secret"),
-        contentType: req.header("content-type")
-      }
+      hasSig: !!req.header("X-Vapi-Signature"),
+      hasLegacy: !!req.header("X-Vapi-Secret"),
+      contentType: req.header("content-type")
     });
 
     const okSig = verifyVapi(req);
     if (!okSig) {
       console.warn("Invalid signature");
-      if (STRICT_SIGNATURE) {
-        return res.status(403).json({ error: "Invalid signature" });
-      } else {
-        // Soft-fail to keep Vapi “connected” during setup
-        return res.status(200).json({ results: [{ error: "Invalid signature" }] });
-      }
+      if (STRICT_SIGNATURE) return res.status(403).json({ error: "Invalid signature" });
+      // soft-fail path while debugging
+      return res.status(200).json({ results: [{ error: "Invalid signature" }] });
     }
 
     const message = req.body?.message || req.body || {};
-    if (!ensureAssistantOk(message)) {
-      return res.status(404).json({ error: "Assistant mismatch" });
-    }
+    if (!ensureAssistantOk(message)) return res.status(404).json({ error: "Assistant mismatch" });
 
     const toolCalls = message.toolCalls || [];
     const results = [];
@@ -210,7 +187,7 @@ app.post("/webhook", async (req, res) => {
 
       try {
         switch (name) {
-          // Canonical names + aliases to match your prompt/tools
+          // canonical names + aliases to match your Vapi tools/prompt
           case "create_or_update_hubspot_contact":
           case "create_or_update_contact":
             result = await upsertContact(args);
@@ -235,7 +212,7 @@ app.post("/webhook", async (req, res) => {
             };
             break;
 
-          // Not wired yet—don’t crash the call
+          // not wired yet—don’t crash the call
           case "set_lead_status":
           case "mark_dnc":
           case "remove_number_from_contact":
@@ -255,7 +232,7 @@ app.post("/webhook", async (req, res) => {
       results.push({ toolCallId: callId, result });
     }
 
-    return res.json({ results }); // Always 200 with results array
+    return res.json({ results });
   } catch (err) {
     console.error("Webhook error:", err?.response?.data || err.message);
     return res.status(200).json({ results: [{ error: "Server error", detail: String(err.message || err) }] });
