@@ -10,16 +10,12 @@ const app = express();
 /* ---------------- CONFIG ---------------- */
 const PORT = process.env.PORT || 8080;
 
-// Optional: lock to your assistant (warn-only)
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // e.g. "0d1f5365-a01e-4af4-b240-0fd0db2631ae"
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || "";
+const VAPI_ASSISTANT_ID_OUTBOUND = process.env.VAPI_ASSISTANT_ID_OUTBOUND || ""; // optional default outbound assistant id
 
-// Vapi Assistant → Advanced → Server URL → Secret (leave headers empty)
 const VAPI_SERVER_SECRET = process.env.VAPI_SERVER_SECRET;
-
-// Strict signature check (set STRICT_SIGNATURE=false while debugging)
 const STRICT_SIGNATURE = (process.env.STRICT_SIGNATURE ?? "true").toLowerCase() === "true";
 
-// HubSpot Private App token (contacts/deals/notes write scopes)
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 
 /* ---------------- MIDDLEWARE ---------------- */
@@ -29,13 +25,13 @@ app.use(express.json({ limit: "1mb" }));
 
 /* ---------------- HELPERS ---------------- */
 function verifyVapi(req) {
-  const hSig = req.header("X-Vapi-Signature");
-  const hLegacy = req.header("X-Vapi-Secret"); // accepted for header-credential setups
+  const sig = req.header("X-Vapi-Signature");
+  const legacy = req.header("X-Vapi-Secret");
   if (!VAPI_SERVER_SECRET) {
     console.warn("WARNING: VAPI_SERVER_SECRET not set; skipping signature verification.");
     return true;
   }
-  return (hSig && hSig === VAPI_SERVER_SECRET) || (hLegacy && hLegacy === VAPI_SERVER_SECRET);
+  return (sig && sig === VAPI_SERVER_SECRET) || (legacy && legacy === VAPI_SERVER_SECRET);
 }
 
 function ensureAssistantOk(message) {
@@ -56,7 +52,54 @@ const hs = axios.create({
   timeout: 15000
 });
 
-/* ---------------- HUBSPOT HELPERS ---------------- */
+function stripPhone(p) {
+  if (!p) return "";
+  return String(p).replace(/[^\d+]/g, "");
+}
+
+/* ---------------- HUBSPOT: CONTACT HELPERS ---------------- */
+async function searchContact({ phone, email }) {
+  // OR logic via multiple filterGroups
+  const filterGroups = [];
+  if (phone) {
+    filterGroups.push({ filters: [{ propertyName: "phone", operator: "EQ", value: phone }] });
+    filterGroups.push({ filters: [{ propertyName: "mobilephone", operator: "EQ", value: phone }] });
+  }
+  if (email) {
+    filterGroups.push({ filters: [{ propertyName: "email", operator: "EQ", value: email }] });
+  }
+
+  try {
+    const { data } = await hs.post(`/crm/v3/objects/contacts/search`, {
+      filterGroups,
+      properties: [
+        "firstname","lastname","email","phone","mobilephone",
+        "address","city","state","zip",
+        "last_summary",
+        // optional custom properties you might add later:
+        "motivation","house_condition","land_details","lease_end_date",
+        "timing_window","price_feel","entitlement_ok"
+      ],
+      limit: 1
+    });
+    const c = data?.results?.[0];
+    return c ? { id: c.id, properties: c.properties || {} } : null;
+  } catch (e) {
+    console.error("HubSpot search contact error:", e?.response?.data || e.message);
+    return null;
+  }
+}
+
+async function updateContactProps(contactId, properties) {
+  if (!contactId || !properties) return;
+  try {
+    await hs.patch(`/crm/v3/objects/contacts/${contactId}`, { properties });
+  } catch (e) {
+    console.error("HubSpot update contact error:", e?.response?.data || e.message);
+  }
+}
+
+/* ---------------- HUBSPOT: CORE OPS ---------------- */
 async function findContactIdByEmail(email) {
   if (!email) return null;
   try {
@@ -93,8 +136,13 @@ async function upsertContact(args) {
   if (propertyZip) properties.zip = propertyZip;
 
   let contactId = await findContactIdByEmail(email);
+  if (!contactId && phone) {
+    const s = await searchContact({ phone });
+    contactId = s?.id || null;
+  }
+
   if (contactId) {
-    await hs.patch(`/crm/v3/objects/contacts/${contactId}`, { properties });
+    await updateContactProps(contactId, properties);
     return { id: contactId, updated: true };
   } else {
     const { data } = await hs.post(`/crm/v3/objects/contacts`, { properties });
@@ -115,7 +163,6 @@ async function createDeal(args) {
 
   if (associated_contact_id) {
     try {
-      // v4 default association: deal -> contact
       await hs.put(`/crm/v4/objects/deal/${dealId}/associations/default/contact/${associated_contact_id}`);
     } catch (e) {
       console.error("Associate deal->contact failed:", e?.response?.data || e.message);
@@ -139,12 +186,20 @@ async function createNote(args) {
     } catch (e) {
       console.error("Associate note->contact failed:", e?.response?.data || e.message);
     }
+
+    // --- Memory: also update contact.last_summary with a one-liner from this note
+    const firstLine = String(note || "").split(/\r?\n/)[0].trim();
+    const compact = firstLine.length > 240 ? firstLine.slice(0, 237) + "..." : firstLine;
+    if (compact) {
+      await updateContactProps(contact_id, { last_summary: compact });
+    }
   }
   return { id: noteId };
 }
 
 /* ---------------- ROUTES ---------------- */
 app.get("/", (_req, res) => res.status(200).send("Vapi ↔ HubSpot bridge is up"));
+
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -156,25 +211,66 @@ app.get("/health", (_req, res) => {
   });
 });
 
+/**
+ * Core webhook:
+ * - type === "assistant-request"  => return assistant override + variables (memory injection)
+ * - else handle tool calls (message.toolCalls) => return tool results
+ */
 app.post("/webhook", async (req, res) => {
   try {
-    console.log("POST /webhook", {
-      hasSig: !!req.header("X-Vapi-Signature"),
-      hasLegacy: !!req.header("X-Vapi-Secret"),
-      contentType: req.header("content-type")
-    });
-
     const okSig = verifyVapi(req);
     if (!okSig) {
       console.warn("Invalid signature");
       if (STRICT_SIGNATURE) return res.status(403).json({ error: "Invalid signature" });
-      // soft-fail path while debugging
-      return res.status(200).json({ results: [{ error: "Invalid signature" }] });
     }
 
-    const message = req.body?.message || req.body || {};
-    if (!ensureAssistantOk(message)) return res.status(404).json({ error: "Assistant mismatch" });
+    const body = req.body || {};
+    const type = body.type || body?.message?.type || "";
+    const message = body.message || body; // for tool calls fallback
+    ensureAssistantOk(message);
 
+    /* ---------- 1) MEMORY INJECTION ON assistant-request ---------- */
+    if (type === "assistant-request") {
+      // Pull caller identity from request (Vapi sends one of these)
+      const phone =
+        body?.call?.customer?.number ||
+        body?.phoneNumber?.number ||
+        body?.customer?.number ||
+        "";
+      const email =
+        body?.call?.customer?.email ||
+        body?.customer?.email ||
+        "";
+
+      let variables = {};
+      let assistantId = VAPI_ASSISTANT_ID_OUTBOUND || VAPI_ASSISTANT_ID || undefined;
+
+      if (HUBSPOT_TOKEN && (phone || email)) {
+        const stripped = stripPhone(phone);
+        const found = await searchContact({ phone: stripped, email });
+        const p = found?.properties || {};
+        const name = [p.firstname, p.lastname].filter(Boolean).join(" ").trim();
+        const propertyAddress = p.address || "";
+        const city = p.city || "";
+        const state = p.state || "";
+        const last_summary = p.last_summary || "";
+        variables = {
+          name: name || undefined,
+          propertyAddress: propertyAddress || undefined,
+          city: city || undefined,
+          state: state || undefined,
+          last_summary: last_summary || undefined
+        };
+      }
+
+      // Respond with assistant override: you can send assistantId AND variables
+      return res.json({
+        assistantId: assistantId, // optional; omit if you want Vapi to use the one that initiated the call
+        variables
+      });
+    }
+
+    /* ---------- 2) TOOL CALLS (default path) ---------- */
     const toolCalls = message.toolCalls || [];
     const results = [];
 
@@ -187,7 +283,6 @@ app.post("/webhook", async (req, res) => {
 
       try {
         switch (name) {
-          // canonical names + aliases to match your Vapi tools/prompt
           case "create_or_update_hubspot_contact":
           case "create_or_update_contact":
             result = await upsertContact(args);
@@ -212,7 +307,7 @@ app.post("/webhook", async (req, res) => {
             };
             break;
 
-          // not wired yet—don’t crash the call
+          // graceful stubs so the model never crashes:
           case "set_lead_status":
           case "mark_dnc":
           case "remove_number_from_contact":
