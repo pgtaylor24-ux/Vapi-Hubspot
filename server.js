@@ -1,4 +1,4 @@
-// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override + /log notes
+// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override, owner-verified skip, notes logging
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -21,11 +21,15 @@ app.use(express.json({ limit: '1mb' }));
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || '';
 if (!HUBSPOT_TOKEN) console.warn('[WARN] HUBSPOT_PRIVATE_APP_TOKEN is not set.');
 
-// Voice override (optional): set these in Render if you want global tuning
-const VOICE_NAME = process.env.VAPI_VOICE_NAME || '';                // e.g., "sage"
-const VOICE_STABILITY = process.env.VAPI_VOICE_STABILITY || '';      // e.g., "0.35"
-const VOICE_SIMILARITY = process.env.VAPI_VOICE_SIMILARITY || '';    // e.g., "0.85"
-const VOICE_STYLE = process.env.VAPI_VOICE_STYLE || '';              // e.g., "conversational, approachable, calm, short sentences"
+const VOICE_NAME       = process.env.VAPI_VOICE_NAME || '';                // e.g., "sage"
+const VOICE_STABILITY  = process.env.VAPI_VOICE_STABILITY || '0.25';       // "0.25" default
+const VOICE_SIMILARITY = process.env.VAPI_VOICE_SIMILARITY || '0.85';      // "0.85" default
+const VOICE_STYLE      = process.env.VAPI_VOICE_STYLE || 'conversational, approachable, calm, short sentences, human like pacing';
+
+// Optional: persist across deploys with an external store if you want.
+// In-memory is fine to start.
+const leadStatus = new Map(); 
+// shape: leadId -> { status: 'owner_verified'|'wrong_number'|'no_answer', verifiedBy: '+1...' }
 
 let hubspot = null;
 if (HubSpotClient && HUBSPOT_TOKEN) hubspot = new HubSpotClient({ accessToken: HUBSPOT_TOKEN });
@@ -35,9 +39,8 @@ const get = (obj, path, fb = undefined) =>
   path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj) ?? fb;
 
 const normalizePhone = (raw = '') =>
-  raw.replace(/[^\d+]/g, '').replace(/^1(\d{10})$/, '+1$1');
+  (raw || '').replace(/[^\d+]/g, '').replace(/^1(\d{10})$/, '+1$1');
 
-// ---------- Enhanced logging ----------
 const log = (level, message, data = null) => {
   const timestamp = new Date().toISOString();
   const logData = data ? ` | Data: ${JSON.stringify(data, null, 2)}` : '';
@@ -48,9 +51,8 @@ const log = (level, message, data = null) => {
 async function hsSearchContactsByPhone(phone) {
   const q = normalizePhone(phone);
   if (!q) return [];
-  
   log('info', `Searching contacts for phone: ${q}`);
-  
+
   if (hubspot) {
     try {
       const resp = await hubspot.crm.contacts.searchApi.doSearch({
@@ -60,7 +62,7 @@ async function hsSearchContactsByPhone(phone) {
       });
       log('info', `SDK found ${resp.results?.length || 0} contacts`);
       return resp.results || [];
-    } catch (e) { 
+    } catch (e) {
       log('error', 'SDK searchContactsByPhone failed', e.response?.data || e.message);
     }
   }
@@ -74,15 +76,14 @@ async function hsSearchContactsByPhone(phone) {
     const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     log('info', `REST found ${resp.data?.results?.length || 0} contacts`);
     return resp.data?.results || [];
-  } catch (e) { 
+  } catch (e) {
     log('error', 'REST searchContactsByPhone failed', e.response?.data || e.message);
-    return []; 
+    return [];
   }
 }
 
 async function hsGetDealsForContact(contactId) {
   log('info', `Getting deals for contact: ${contactId}`);
-  
   if (hubspot) {
     try {
       const assoc = await hubspot.crm.contacts.associationsApi.getAll('contacts', contactId, 'deals');
@@ -97,7 +98,7 @@ async function hsGetDealsForContact(contactId) {
       });
       log('info', `SDK found ${batch?.results?.length || 0} deals`);
       return batch?.results || [];
-    } catch (e) { 
+    } catch (e) {
       log('error', 'SDK getDealsForContact failed', e.response?.data || e.message);
     }
   }
@@ -117,17 +118,16 @@ async function hsGetDealsForContact(contactId) {
     const batch = await axios.post(readUrl, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     log('info', `REST found ${batch.data?.results?.length || 0} deals`);
     return batch.data?.results || [];
-  } catch (e) { 
+  } catch (e) {
     log('error', 'REST getDealsForContact failed', e.response?.data || e.message);
-    return []; 
+    return [];
   }
 }
 
 async function hsSearchDealsByAddress(addressLike) {
   if (!addressLike) return [];
-  
   log('info', `Searching deals by address: ${addressLike}`);
-  
+
   if (hubspot) {
     try {
       const resp = await hubspot.crm.deals.searchApi.doSearch({
@@ -137,7 +137,7 @@ async function hsSearchDealsByAddress(addressLike) {
       });
       log('info', `SDK found ${resp?.results?.length || 0} deals by address`);
       return resp?.results || [];
-    } catch (e) { 
+    } catch (e) {
       log('error', 'SDK searchDealsByAddress failed', e.response?.data || e.message);
     }
   }
@@ -151,9 +151,9 @@ async function hsSearchDealsByAddress(addressLike) {
     const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     log('info', `REST found ${resp.data?.results?.length || 0} deals by address`);
     return resp.data?.results || [];
-  } catch (e) { 
+  } catch (e) {
     log('error', 'REST searchDealsByAddress failed', e.response?.data || e.message);
-    return []; 
+    return [];
   }
 }
 
@@ -180,7 +180,7 @@ function buildLastSummary({ contact, deal }) {
   return lines.filter(Boolean).join(' • ');
 }
 
-// ---------- Core builder ----------
+// ---------- Build assistant override ----------
 async function buildAssistantOverride(payload = {}) {
   const phone = payload.phone || payload.from || payload.callerPhone || '';
   const property_address = payload.property_address || payload.address || '';
@@ -212,23 +212,19 @@ async function buildAssistantOverride(payload = {}) {
     last_summary: buildLastSummary({ contact, deal })
   };
 
-  // === Patch #1: safe greeting variables so we never speak blanks ===
-  vars.display_name = vars.seller_first_name || 'there';
-  vars.display_property = vars.property_address
-    ? `${vars.property_address}${vars.city ? ', ' + vars.city : ''}${vars.state ? ', ' + vars.state : ''}`
-    : 'your property';
-
   log('info', 'Generated variables', vars);
 
-  // === Patch #3: improved dynamic opener using safe vars ===
   let instructions_append = '';
-  instructions_append =
-    `OPEN LIKE THIS (adjust naturally): "Hi ${vars.display_name}, this is Alex with Taylor Real Estate Group. ` +
-    `I'm calling about ${vars.display_property}. Did I catch you at an okay moment?" ` +
-    `${vars.last_summary ? 'Previous context: ' + vars.last_summary + '. ' : ''}` +
-    `Keep it human. One question at a time. Vary acknowledgments (okay / makes sense / thanks). Avoid saying 'Got it'.`;
+  if (vars.property_address || vars.last_summary) {
+    instructions_append =
+      `OPEN LIKE THIS (adjust naturally): "Hi ${vars.seller_first_name ? vars.seller_first_name + ', ' : ''}` +
+      `this is Alex with Taylor Real Estate Group. I'm calling about ${vars.property_address || 'your property'}` +
+      `${vars.city ? ' in ' + vars.city : ''}. Did I catch you at an okay moment?" ` +
+      `${vars.last_summary ? 'Previous context: ' + vars.last_summary + '. ' : ''}` +
+      `Keep the conversation flowing naturally - don't just read this word for word.`;
+  }
 
-  // ---------- Voice override (env + per-request) ----------
+  // Voice override (env + per-request)
   const voiceOverride = {};
   const reqVoiceName = payload.voice_name || payload.voiceName;
   const reqStability = payload.voice_stability ?? payload.voiceStability;
@@ -240,13 +236,9 @@ async function buildAssistantOverride(payload = {}) {
   const similarity = (reqSimilarity !== undefined ? reqSimilarity : VOICE_SIMILARITY);
   const style = reqStyle || VOICE_STYLE;
 
-  // === Patch #2: set both name and voiceId for compatibility across tenants ===
   if (name || stability !== '' || similarity !== '' || style) {
     voiceOverride.provider = 'openai';
-    if (name) {
-      voiceOverride.name = String(name);        // e.g., "sage"
-      voiceOverride.voiceId = String(name);     // some tenants expect voiceId
-    }
+    if (name) voiceOverride.name = String(name);
     if (stability !== '') voiceOverride.stability = Number(stability);
     if (similarity !== '') voiceOverride.similarity_boost = Number(similarity);
     if (style) voiceOverride.style = String(style);
@@ -264,14 +256,62 @@ async function buildAssistantOverride(payload = {}) {
   return response;
 }
 
-// ---------- Notes helpers ----------
+// ---------- Lead status endpoint (mark when owner verified / wrong number) ----------
+app.post('/lead-status', (req, res) => {
+  const { leadId, status, number } = req.body || {};
+  if (!leadId || !status) {
+    return res.status(400).json({ ok: false, error: 'leadId and status are required' });
+  }
+  const prev = leadStatus.get(leadId) || {};
+  const next = { ...prev, status, verifiedBy: status === 'owner_verified' ? (number || prev.verifiedBy) : prev.verifiedBy };
+  leadStatus.set(leadId, next);
+  log('info', 'Lead status updated', { leadId, ...next });
+  res.json({ ok: true, leadId, ...next });
+});
+
+// ---------- Core handler (pre-call + per-call webhook) ----------
+async function handler(req, res) {
+  try {
+    log('info', `Handling ${req.method} ${req.path}`, req.body);
+
+    // Skip other numbers if owner already verified for this lead
+    const { leadId, number } = req.body || {};
+    const ls = leadStatus.get(leadId);
+    if (leadId && ls?.status === 'owner_verified' && number && number !== ls.verifiedBy) {
+      log('info', 'Skipping call: owner already verified on another number', { leadId, number, verifiedBy: ls.verifiedBy });
+      return res.json({
+        assistantOverride: {
+          variables: { leadId },
+          instructions_append:
+            'This lead is already owner-verified on another number. Politely say: ' +
+            '"Looks like we already connected with the owner earlier, I’ll update our notes. Thanks!" ' +
+            'Then hang up immediately.'
+        }
+      });
+    }
+
+    const override = await buildAssistantOverride(req.body || {});
+    res.json(override);
+  } catch (e) {
+    log('error', 'Handler fatal error', e);
+    res.status(200).json({
+      assistantOverride: {
+        variables: {},
+        instructions_append: ''
+      }
+    });
+  }
+}
+
+// Called by Vapi to enrich variables/voice (pre-call) or per-call webhooks
+app.post('/assistant-request', handler);
+app.post('/webhook', handler);
+
+// ---------- Notes logging to HubSpot (optional) ----------
 async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
   log('info', 'Creating note', { contactId, dealId, bodyLength: body?.length });
-  
-  // Create the note
   let noteId = null;
 
-  // SDK path
   if (hubspot) {
     try {
       const created = await hubspot.crm.notes.basicApi.create({
@@ -282,7 +322,6 @@ async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
     } catch (e) {
       log('error', 'SDK create note failed', e.response?.data || e.message);
     }
-    // Associate if created
     try {
       if (noteId && contactId) {
         await hubspot.crm.notes.associationsApi.create(noteId, 'contacts', contactId, 'note_to_contact');
@@ -298,18 +337,14 @@ async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
     return noteId;
   }
 
-  // REST fallback
   try {
     const createUrl = 'https://api.hubapi.com/crm/v3/objects/notes';
-    const created = await axios.post(createUrl, {
-      properties: { hs_note_body: body }
-    }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    const created = await axios.post(createUrl, { properties: { hs_note_body: body }}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     noteId = created?.data?.id;
     log('info', `REST created note: ${noteId}`);
   } catch (e) {
     log('error', 'REST create note failed', e.response?.data || e.message);
   }
-  // Associate (REST v3 associations)
   try {
     if (noteId && contactId) {
       const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`;
@@ -328,12 +363,11 @@ async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
 }
 
 function buildNoteBody(payload = {}) {
-  // Enhanced note formatting with better structure
   const parts = [];
   const timestamp = new Date().toLocaleString();
   parts.push(`Call Summary - ${timestamp}`);
   parts.push('---');
-  
+
   if (payload.property_address || payload.city || payload.state) {
     parts.push(`Property: ${[payload.property_address, payload.city, payload.state].filter(Boolean).join(', ')}`);
   }
@@ -345,71 +379,26 @@ function buildNoteBody(payload = {}) {
   if (payload.next_step) parts.push(`Next step: ${payload.next_step}`);
   if (payload.scheduled_time) parts.push(`Follow-up scheduled: ${payload.scheduled_time}`);
   if (payload.phone) parts.push(`Phone: ${payload.phone}`);
-  
+
   if (payload.transcript) {
     parts.push('---');
     parts.push('Full Transcript:');
     parts.push(payload.transcript);
   }
-  
   return parts.join('\n');
 }
 
-// ---------- Routes ----------
-async function handler(req, res) {
-  try {
-    log('info', `Handling ${req.method} ${req.path}`, req.body);
-    const override = await buildAssistantOverride(req.body || {});
-    res.json(override);
-  } catch (e) {
-    log('error', 'Handler fatal error', e);
-    res.status(200).json({ 
-      assistantOverride: { 
-        variables: {}, 
-        instructions_append: '' 
-      }
-    });
-  }
-}
-
-// Called by Vapi: enrich variables/voice each call
-app.post('/assistant-request', handler);
-app.post('/webhook', handler);
-
-// Optional: health + diag
-app.get('/health', (_, res) => res.send('ok'));
-app.get('/diag', (_, res) => {
-  const diagnostics = {
-    timestamp: new Date().toISOString(),
-    node: process.versions.node,
-    hasHubSpotSDK: !!hubspot,
-    envHasToken: !!HUBSPOT_TOKEN,
-    voiceEnv: {
-      name: VOICE_NAME || null,
-      stability: VOICE_STABILITY || null,
-      similarity: VOICE_SIMILARITY || null,
-      style: VOICE_STYLE || null
-    }
-  };
-  log('info', 'Diagnostics requested', diagnostics);
-  res.json(diagnostics);
-});
-
-// Enhanced /log endpoint with better error handling
 app.post('/log', async (req, res) => {
   try {
     log('info', 'Processing log request', req.body);
-    
     const p = req.body || {};
     const phone = p.phone || p.from || p.callerPhone || '';
     let contactId = null;
     let dealId = null;
 
-    // Find contact by phone
     const contacts = await hsSearchContactsByPhone(phone);
     if (contacts.length) contactId = contacts[0].id;
 
-    // Try to find a deal by contact association or address
     if (contactId) {
       const deals = await hsGetDealsForContact(contactId);
       if (deals?.length) dealId = deals[0].id;
@@ -431,7 +420,26 @@ app.post('/log', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// Health/diag
+app.get('/health', (_, res) => res.send('ok'));
+app.get('/diag', (_, res) => {
+  const diagnostics = {
+    timestamp: new Date().toISOString(),
+    node: process.versions.node,
+    hasHubSpotSDK: !!hubspot,
+    envHasToken: !!HUBSPOT_TOKEN,
+    voiceEnv: {
+      name: VOICE_NAME || null,
+      stability: VOICE_STABILITY || null,
+      similarity: VOICE_SIMILARITY || null,
+      style: VOICE_STYLE || null
+    }
+  };
+  log('info', 'Diagnostics requested', diagnostics);
+  res.json(diagnostics);
+});
+
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   log('info', `Assistant webhook running on port ${PORT}`);
   log('info', 'Server configuration', {
