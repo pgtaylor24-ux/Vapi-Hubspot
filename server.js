@@ -1,9 +1,10 @@
-// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override, owner-verified skip, notes logging
+// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override, lead status, and logging
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import axios from 'axios';
 
+// --- Try HubSpot SDK first; fall back to REST if not installed ---
 let HubSpotClient = null;
 try {
   const mod = await import('@hubspot/api-client');
@@ -19,45 +20,45 @@ app.use(express.json({ limit: '1mb' }));
 
 // ---------- ENV ----------
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || '';
-if (!HUBSPOT_TOKEN) console.warn('[WARN] HUBSPOT_PRIVATE_APP_TOKEN is not set.');
+if (!HUBSPOT_TOKEN) console.warn('[WARN] HUBSPOT_PRIVATE_APP_TOKEN is not set. HubSpot calls will be skipped.');
 
-const VOICE_NAME       = process.env.VAPI_VOICE_NAME || '';                // e.g., "sage"
-const VOICE_STABILITY  = process.env.VAPI_VOICE_STABILITY || '0.25';       // "0.25" default
-const VOICE_SIMILARITY = process.env.VAPI_VOICE_SIMILARITY || '0.85';      // "0.85" default
-const VOICE_STYLE      = process.env.VAPI_VOICE_STYLE || 'conversational, approachable, calm, short sentences, human like pacing';
-
-// Optional: persist across deploys with an external store if you want.
-// In-memory is fine to start.
-const leadStatus = new Map(); 
-// shape: leadId -> { status: 'owner_verified'|'wrong_number'|'no_answer', verifiedBy: '+1...' }
+const VOICE_NAME = process.env.VAPI_VOICE_NAME || '';                // e.g., "sage"
+const VOICE_STABILITY = process.env.VAPI_VOICE_STABILITY || '';      // e.g., "0.25"
+const VOICE_SIMILARITY = process.env.VAPI_VOICE_SIMILARITY || '';    // e.g., "0.85"
+const VOICE_STYLE = process.env.VAPI_VOICE_STYLE || '';              // e.g., "conversational, approachable, calm, short sentences"
 
 let hubspot = null;
-if (HubSpotClient && HUBSPOT_TOKEN) hubspot = new HubSpotClient({ accessToken: HUBSPOT_TOKEN });
+if (HubSpotClient && HUBSPOT_TOKEN) {
+  hubspot = new HubSpotClient({ accessToken: HUBSPOT_TOKEN });
+}
 
 // ---------- Utils ----------
 const get = (obj, path, fb = undefined) =>
   path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj) ?? fb;
 
 const normalizePhone = (raw = '') =>
-  (raw || '').replace(/[^\d+]/g, '').replace(/^1(\d{10})$/, '+1$1');
+  raw.replace(/[^\d+]/g, '').replace(/^1(\d{10})$/, '+1$1');
 
 const log = (level, message, data = null) => {
-  const timestamp = new Date().toISOString();
-  const logData = data ? ` | Data: ${JSON.stringify(data, null, 2)}` : '';
-  console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}${logData}`);
+  const ts = new Date().toISOString();
+  const suffix = data != null ? ` | Data: ${JSON.stringify(data, null, 2)}` : '';
+  console.log(`[${ts}] [${level.toUpperCase()}] ${message}${suffix}`);
 };
 
 // ---------- HubSpot helpers (SDK with REST fallback) ----------
 async function hsSearchContactsByPhone(phone) {
   const q = normalizePhone(phone);
-  if (!q) return [];
+  if (!q || !HUBSPOT_TOKEN) return [];
   log('info', `Searching contacts for phone: ${q}`);
 
+  // SDK
   if (hubspot) {
     try {
       const resp = await hubspot.crm.contacts.searchApi.doSearch({
-        filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: q.replace('+1','') }] }],
-        properties: ['firstname','lastname','email','phone','address','city','state','zip'],
+        filterGroups: [
+          { filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: q.replace('+1', '') }] }
+        ],
+        properties: ['firstname', 'lastname', 'email', 'phone', 'address', 'city', 'state', 'zip'],
         limit: 5
       });
       log('info', `SDK found ${resp.results?.length || 0} contacts`);
@@ -66,14 +67,19 @@ async function hsSearchContactsByPhone(phone) {
       log('error', 'SDK searchContactsByPhone failed', e.response?.data || e.message);
     }
   }
+  // REST
   try {
     const url = 'https://api.hubapi.com/crm/v3/objects/contacts/search';
     const body = {
-      filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: q.replace('+1','') }] }],
-      properties: ['firstname','lastname','email','phone','address','city','state','zip'],
+      filterGroups: [
+        { filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: q.replace('+1', '') }] }
+      ],
+      properties: ['firstname', 'lastname', 'email', 'phone', 'address', 'city', 'state', 'zip'],
       limit: 5
     };
-    const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    const resp = await axios.post(url, body, {
+      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
+    });
     log('info', `REST found ${resp.data?.results?.length || 0} contacts`);
     return resp.data?.results || [];
   } catch (e) {
@@ -83,18 +89,18 @@ async function hsSearchContactsByPhone(phone) {
 }
 
 async function hsGetDealsForContact(contactId) {
+  if (!contactId || !HUBSPOT_TOKEN) return [];
   log('info', `Getting deals for contact: ${contactId}`);
+
+  // SDK
   if (hubspot) {
     try {
       const assoc = await hubspot.crm.contacts.associationsApi.getAll('contacts', contactId, 'deals');
       const ids = (assoc?.results || []).map(r => r.to?.id).filter(Boolean);
-      if (!ids.length) {
-        log('info', 'No deals found for contact');
-        return [];
-      }
+      if (!ids.length) return [];
       const batch = await hubspot.crm.deals.batchApi.read({
         inputs: ids.map(id => ({ id })),
-        properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation']
+        properties: ['dealname', 'amount', 'address', 'city', 'state', 'zip', 'property_type', 'asking_price', 'timeline', 'motivation']
       });
       log('info', `SDK found ${batch?.results?.length || 0} deals`);
       return batch?.results || [];
@@ -102,20 +108,18 @@ async function hsGetDealsForContact(contactId) {
       log('error', 'SDK getDealsForContact failed', e.response?.data || e.message);
     }
   }
+  // REST
   try {
     const assocUrl = `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/deals`;
-    const assoc = await axios.get(assocUrl, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    const assoc = await axios.get(assocUrl, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
     const ids = (assoc.data?.results || []).map(r => r.toObjectId).filter(Boolean);
-    if (!ids.length) {
-      log('info', 'No deals found for contact');
-      return [];
-    }
+    if (!ids.length) return [];
     const readUrl = 'https://api.hubapi.com/crm/v3/objects/deals/batch/read';
     const body = {
-      properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
+      properties: ['dealname', 'amount', 'address', 'city', 'state', 'zip', 'property_type', 'asking_price', 'timeline', 'motivation'],
       inputs: ids.map(id => ({ id: String(id) }))
     };
-    const batch = await axios.post(readUrl, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    const batch = await axios.post(readUrl, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
     log('info', `REST found ${batch.data?.results?.length || 0} deals`);
     return batch.data?.results || [];
   } catch (e) {
@@ -125,14 +129,15 @@ async function hsGetDealsForContact(contactId) {
 }
 
 async function hsSearchDealsByAddress(addressLike) {
-  if (!addressLike) return [];
+  if (!addressLike || !HUBSPOT_TOKEN) return [];
   log('info', `Searching deals by address: ${addressLike}`);
 
+  // SDK
   if (hubspot) {
     try {
       const resp = await hubspot.crm.deals.searchApi.doSearch({
         filterGroups: [{ filters: [{ propertyName: 'address', operator: 'CONTAINS_TOKEN', value: addressLike }] }],
-        properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
+        properties: ['dealname', 'amount', 'address', 'city', 'state', 'zip', 'property_type', 'asking_price', 'timeline', 'motivation'],
         limit: 5
       });
       log('info', `SDK found ${resp?.results?.length || 0} deals by address`);
@@ -141,20 +146,78 @@ async function hsSearchDealsByAddress(addressLike) {
       log('error', 'SDK searchDealsByAddress failed', e.response?.data || e.message);
     }
   }
+  // REST
   try {
     const url = 'https://api.hubapi.com/crm/v3/objects/deals/search';
     const body = {
       filterGroups: [{ filters: [{ propertyName: 'address', operator: 'CONTAINS_TOKEN', value: addressLike }] }],
-      properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
+      properties: ['dealname', 'amount', 'address', 'city', 'state', 'zip', 'property_type', 'asking_price', 'timeline', 'motivation'],
       limit: 5
     };
-    const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
     log('info', `REST found ${resp.data?.results?.length || 0} deals by address`);
     return resp.data?.results || [];
   } catch (e) {
     log('error', 'REST searchDealsByAddress failed', e.response?.data || e.message);
     return [];
   }
+}
+
+async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
+  if (!HUBSPOT_TOKEN) return null;
+  log('info', 'Creating note', { contactId, dealId, bodyLength: body?.length });
+
+  let noteId = null;
+
+  // SDK
+  if (hubspot) {
+    try {
+      const created = await hubspot.crm.notes.basicApi.create({
+        properties: { hs_note_body: body }
+      });
+      noteId = created?.id;
+      log('info', `SDK created note: ${noteId}`);
+    } catch (e) {
+      log('error', 'SDK create note failed', e.response?.data || e.message);
+    }
+    try {
+      if (noteId && contactId) {
+        await hubspot.crm.notes.associationsApi.create(noteId, 'contacts', contactId, 'note_to_contact');
+      }
+      if (noteId && dealId) {
+        await hubspot.crm.notes.associationsApi.create(noteId, 'deals', dealId, 'note_to_deal');
+      }
+      return noteId;
+    } catch (e) {
+      log('error', 'SDK note association failed', e.response?.data || e.message);
+      return noteId;
+    }
+  }
+
+  // REST
+  try {
+    const createUrl = 'https://api.hubapi.com/crm/v3/objects/notes';
+    const created = await axios.post(createUrl, { properties: { hs_note_body: body } }, {
+      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
+    });
+    noteId = created?.data?.id;
+    log('info', `REST created note: ${noteId}`);
+  } catch (e) {
+    log('error', 'REST create note failed', e.response?.data || e.message);
+  }
+  try {
+    if (noteId && contactId) {
+      const u1 = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`;
+      await axios.put(u1, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+    }
+    if (noteId && dealId) {
+      const u2 = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/deals/${dealId}/note_to_deal`;
+      await axios.put(u2, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+    }
+  } catch (e) {
+    log('error', 'REST note association failed', e.response?.data || e.message);
+  }
+  return noteId;
 }
 
 function buildLastSummary({ contact, deal }) {
@@ -180,7 +243,7 @@ function buildLastSummary({ contact, deal }) {
   return lines.filter(Boolean).join(' • ');
 }
 
-// ---------- Build assistant override ----------
+// ---------- Assistant override builder ----------
 async function buildAssistantOverride(payload = {}) {
   const phone = payload.phone || payload.from || payload.callerPhone || '';
   const property_address = payload.property_address || payload.address || '';
@@ -212,8 +275,7 @@ async function buildAssistantOverride(payload = {}) {
     last_summary: buildLastSummary({ contact, deal })
   };
 
-  log('info', 'Generated variables', vars);
-
+  // Optional: prepend an opening suggestion to sound even more natural
   let instructions_append = '';
   if (vars.property_address || vars.last_summary) {
     instructions_append =
@@ -221,7 +283,7 @@ async function buildAssistantOverride(payload = {}) {
       `this is Alex with Taylor Real Estate Group. I'm calling about ${vars.property_address || 'your property'}` +
       `${vars.city ? ' in ' + vars.city : ''}. Did I catch you at an okay moment?" ` +
       `${vars.last_summary ? 'Previous context: ' + vars.last_summary + '. ' : ''}` +
-      `Keep the conversation flowing naturally - don't just read this word for word.`;
+      `Don't read it robotically; keep it conversational.`;
   }
 
   // Voice override (env + per-request)
@@ -256,112 +318,7 @@ async function buildAssistantOverride(payload = {}) {
   return response;
 }
 
-// ---------- Lead status endpoint (mark when owner verified / wrong number) ----------
-app.post('/lead-status', (req, res) => {
-  const { leadId, status, number } = req.body || {};
-  if (!leadId || !status) {
-    return res.status(400).json({ ok: false, error: 'leadId and status are required' });
-  }
-  const prev = leadStatus.get(leadId) || {};
-  const next = { ...prev, status, verifiedBy: status === 'owner_verified' ? (number || prev.verifiedBy) : prev.verifiedBy };
-  leadStatus.set(leadId, next);
-  log('info', 'Lead status updated', { leadId, ...next });
-  res.json({ ok: true, leadId, ...next });
-});
-
-// ---------- Core handler (pre-call + per-call webhook) ----------
-async function handler(req, res) {
-  try {
-    log('info', `Handling ${req.method} ${req.path}`, req.body);
-
-    // Skip other numbers if owner already verified for this lead
-    const { leadId, number } = req.body || {};
-    const ls = leadStatus.get(leadId);
-    if (leadId && ls?.status === 'owner_verified' && number && number !== ls.verifiedBy) {
-      log('info', 'Skipping call: owner already verified on another number', { leadId, number, verifiedBy: ls.verifiedBy });
-      return res.json({
-        assistantOverride: {
-          variables: { leadId },
-          instructions_append:
-            'This lead is already owner-verified on another number. Politely say: ' +
-            '"Looks like we already connected with the owner earlier, I’ll update our notes. Thanks!" ' +
-            'Then hang up immediately.'
-        }
-      });
-    }
-
-    const override = await buildAssistantOverride(req.body || {});
-    res.json(override);
-  } catch (e) {
-    log('error', 'Handler fatal error', e);
-    res.status(200).json({
-      assistantOverride: {
-        variables: {},
-        instructions_append: ''
-      }
-    });
-  }
-}
-
-// Called by Vapi to enrich variables/voice (pre-call) or per-call webhooks
-app.post('/assistant-request', handler);
-app.post('/webhook', handler);
-
-// ---------- Notes logging to HubSpot (optional) ----------
-async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
-  log('info', 'Creating note', { contactId, dealId, bodyLength: body?.length });
-  let noteId = null;
-
-  if (hubspot) {
-    try {
-      const created = await hubspot.crm.notes.basicApi.create({
-        properties: { hs_note_body: body }
-      });
-      noteId = created?.id;
-      log('info', `SDK created note: ${noteId}`);
-    } catch (e) {
-      log('error', 'SDK create note failed', e.response?.data || e.message);
-    }
-    try {
-      if (noteId && contactId) {
-        await hubspot.crm.notes.associationsApi.create(noteId, 'contacts', contactId, 'note_to_contact');
-        log('info', `Associated note ${noteId} to contact ${contactId}`);
-      }
-      if (noteId && dealId) {
-        await hubspot.crm.notes.associationsApi.create(noteId, 'deals', dealId, 'note_to_deal');
-        log('info', `Associated note ${noteId} to deal ${dealId}`);
-      }
-    } catch (e) {
-      log('error', 'SDK note association failed', e.response?.data || e.message);
-    }
-    return noteId;
-  }
-
-  try {
-    const createUrl = 'https://api.hubapi.com/crm/v3/objects/notes';
-    const created = await axios.post(createUrl, { properties: { hs_note_body: body }}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
-    noteId = created?.data?.id;
-    log('info', `REST created note: ${noteId}`);
-  } catch (e) {
-    log('error', 'REST create note failed', e.response?.data || e.message);
-  }
-  try {
-    if (noteId && contactId) {
-      const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`;
-      await axios.put(assocUrl, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
-      log('info', `Associated note ${noteId} to contact ${contactId}`);
-    }
-    if (noteId && dealId) {
-      const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/deals/${dealId}/note_to_deal`;
-      await axios.put(assocUrl, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
-      log('info', `Associated note ${noteId} to deal ${dealId}`);
-    }
-  } catch (e) {
-    log('error', 'REST note association failed', e.response?.data || e.message);
-  }
-  return noteId;
-}
-
+// ---------- Build a HubSpot note body ----------
 function buildNoteBody(payload = {}) {
   const parts = [];
   const timestamp = new Date().toLocaleString();
@@ -388,10 +345,122 @@ function buildNoteBody(payload = {}) {
   return parts.join('\n');
 }
 
+// ---------- Core handler ----------
+async function assistantHandler(req, res) {
+  try {
+    log('info', `Handling ${req.method} ${req.path}`, req.body);
+    const override = await buildAssistantOverride(req.body || {});
+    res.json(override);
+  } catch (e) {
+    log('error', 'assistantHandler fatal error', e);
+    res.status(200).json({
+      assistantOverride: {
+        variables: {},
+        instructions_append: ''
+      }
+    });
+  }
+}
+
+// ---------- Routes ----------
+app.get('/', (_, res) => res.status(200).send('assistant webhook ok'));
+app.get('/health', (_, res) => res.status(200).send('ok'));
+app.get('/diag', (_, res) => {
+  const diagnostics = {
+    timestamp: new Date().toISOString(),
+    node: process.versions.node,
+    hasHubSpotSDK: !!hubspot,
+    envHasToken: !!HUBSPOT_TOKEN,
+    voiceEnv: {
+      name: VOICE_NAME || null,
+      stability: VOICE_STABILITY || null,
+      similarity: VOICE_SIMILARITY || null,
+      style: VOICE_STYLE || null
+    }
+  };
+  log('info', 'Diagnostics requested', diagnostics);
+  res.json(diagnostics);
+});
+
+// Enrich assistant per-call (Vapi calls one of these)
+app.post('/assistant-request', assistantHandler);
+app.post('/webhook', assistantHandler);
+
+// --- Lead Status (Webhook Tool target) ---
+app.post('/lead-status', async (req, res) => {
+  try {
+    let { leadId, status, note, stopDialingRestOfNumbers } = req.body || {};
+    // Coerce "true"/"false" (string) → boolean for safer Vapi UI validation
+    if (typeof stopDialingRestOfNumbers === 'string') {
+      stopDialingRestOfNumbers = stopDialingRestOfNumbers.toLowerCase() === 'true';
+    }
+    log('info', 'setLeadStatus called', { leadId, status, note, stopDialingRestOfNumbers });
+    if (!leadId || !status) {
+      return res.status(400).json({ ok: false, error: 'leadId and status are required' });
+    }
+
+    // Optional: write a note to HubSpot
+    if (note) {
+      await hsCreateNoteAndAssociate({
+        body: `Status: ${status}\nNote: ${note}\nLeadId: ${leadId}\nStop dialing rest: ${!!stopDialingRestOfNumbers}`,
+        contactId: null,
+        dealId: null
+      });
+    }
+
+    return res.json({
+      ok: true,
+      leadId,
+      status,
+      stopDialingRestOfNumbers: !!stopDialingRestOfNumbers
+    });
+  } catch (e) {
+    log('error', 'setLeadStatus failed', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --- Function-tool variant (only if you keep a Function instead of Webhook) ---
+app.post('/function/setLeadStatus', async (req, res) => {
+  try {
+    // Some org setups send { arguments: { ... } }
+    const args = req.body?.arguments || req.body || {};
+    let { leadId, status, note, stopDialingRestOfNumbers } = args;
+    if (typeof stopDialingRestOfNumbers === 'string') {
+      stopDialingRestOfNumbers = stopDialingRestOfNumbers.toLowerCase() === 'true';
+    }
+    log('info', 'Function setLeadStatus invoked', { leadId, status, note, stopDialingRestOfNumbers });
+
+    if (!leadId || !status) {
+      return res.status(400).json({ ok: false, error: 'leadId and status are required' });
+    }
+
+    if (note) {
+      await hsCreateNoteAndAssociate({
+        body: `Status: ${status}\nNote: ${note}\nLeadId: ${leadId}\nStop dialing rest: ${!!stopDialingRestOfNumbers}`,
+        contactId: null,
+        dealId: null
+      });
+    }
+
+    return res.json({
+      ok: true,
+      leadId,
+      status,
+      stopDialingRestOfNumbers: !!stopDialingRestOfNumbers
+    });
+  } catch (e) {
+    log('error', 'Function setLeadStatus failed', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --- Rich call outcome logging (optional) ---
 app.post('/log', async (req, res) => {
   try {
-    log('info', 'Processing log request', req.body);
     const p = req.body || {};
+    log('info', 'Processing log request', p);
+
     const phone = p.phone || p.from || p.callerPhone || '';
     let contactId = null;
     let dealId = null;
@@ -418,25 +487,6 @@ app.post('/log', async (req, res) => {
     log('error', 'Log request failed', e);
     res.status(500).json({ ok: false, error: e.message });
   }
-});
-
-// Health/diag
-app.get('/health', (_, res) => res.send('ok'));
-app.get('/diag', (_, res) => {
-  const diagnostics = {
-    timestamp: new Date().toISOString(),
-    node: process.versions.node,
-    hasHubSpotSDK: !!hubspot,
-    envHasToken: !!HUBSPOT_TOKEN,
-    voiceEnv: {
-      name: VOICE_NAME || null,
-      stability: VOICE_STABILITY || null,
-      similarity: VOICE_SIMILARITY || null,
-      style: VOICE_STYLE || null
-    }
-  };
-  log('info', 'Diagnostics requested', diagnostics);
-  res.json(diagnostics);
 });
 
 const PORT = process.env.PORT || 8080;
