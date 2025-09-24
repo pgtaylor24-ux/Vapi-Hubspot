@@ -1,4 +1,4 @@
-// server.js (ESM) – Vapi ↔ HubSpot bridge
+// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override via env/request
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -6,7 +6,6 @@ import axios from 'axios';
 
 let HubSpotClient = null;
 try {
-  // Optional: if the SDK is installed, we’ll use it; otherwise we’ll fallback to REST via axios.
   const mod = await import('@hubspot/api-client');
   HubSpotClient = mod.Client;
   console.log('[init] Using @hubspot/api-client SDK');
@@ -18,28 +17,30 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+// ---------- ENV ----------
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || '';
-if (!HUBSPOT_TOKEN) {
-  console.warn('[WARN] HUBSPOT_PRIVATE_APP_TOKEN is not set.');
-}
+if (!HUBSPOT_TOKEN) console.warn('[WARN] HUBSPOT_PRIVATE_APP_TOKEN is not set.');
 
-// ---------- HubSpot helpers ----------
+// Voice override (optional): set these in Render if you want global tuning
+const VOICE_NAME = process.env.VAPI_VOICE_NAME || '';                // e.g., "ash"
+const VOICE_STABILITY = process.env.VAPI_VOICE_STABILITY || '';      // e.g., "0.35"
+const VOICE_SIMILARITY = process.env.VAPI_VOICE_SIMILARITY || '';    // e.g., "0.85"
+const VOICE_STYLE = process.env.VAPI_VOICE_STYLE || '';              // e.g., "conversational, approachable, calm, short sentences"
+
+let hubspot = null;
+if (HubSpotClient && HUBSPOT_TOKEN) hubspot = new HubSpotClient({ accessToken: HUBSPOT_TOKEN });
+
+// ---------- Utils ----------
 const get = (obj, path, fb = undefined) =>
   path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj) ?? fb;
 
 const normalizePhone = (raw = '') =>
   raw.replace(/[^\d+]/g, '').replace(/^1(\d{10})$/, '+1$1');
 
-let hubspot = null;
-if (HubSpotClient && HUBSPOT_TOKEN) {
-  hubspot = new HubSpotClient({ accessToken: HUBSPOT_TOKEN });
-}
-
+// ---------- HubSpot helpers (SDK with REST fallback) ----------
 async function hsSearchContactsByPhone(phone) {
   const q = normalizePhone(phone);
   if (!q) return [];
-
-  // Use SDK if available
   if (hubspot) {
     try {
       const resp = await hubspot.crm.contacts.searchApi.doSearch({
@@ -48,13 +49,8 @@ async function hsSearchContactsByPhone(phone) {
         limit: 5
       });
       return resp.results || [];
-    } catch (e) {
-      console.error('SDK searchContactsByPhone error:', e.response?.data || e.message);
-      return [];
-    }
+    } catch (e) { console.error('SDK searchContactsByPhone', e.response?.data || e.message); }
   }
-
-  // Fallback REST
   try {
     const url = 'https://api.hubapi.com/crm/v3/objects/contacts/search';
     const body = {
@@ -62,18 +58,12 @@ async function hsSearchContactsByPhone(phone) {
       properties: ['firstname','lastname','email','phone','address','city','state','zip'],
       limit: 5
     };
-    const resp = await axios.post(url, body, {
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-    });
+    const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     return resp.data?.results || [];
-  } catch (e) {
-    console.error('REST searchContactsByPhone error:', e.response?.data || e.message);
-    return [];
-  }
+  } catch (e) { console.error('REST searchContactsByPhone', e.response?.data || e.message); return []; }
 }
 
 async function hsGetDealsForContact(contactId) {
-  // SDK path
   if (hubspot) {
     try {
       const assoc = await hubspot.crm.contacts.associationsApi.getAll('contacts', contactId, 'deals');
@@ -84,40 +74,25 @@ async function hsGetDealsForContact(contactId) {
         properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation']
       });
       return batch?.results || [];
-    } catch (e) {
-      console.error('SDK getDealsForContact error:', e.response?.data || e.message);
-      return [];
-    }
+    } catch (e) { console.error('SDK getDealsForContact', e.response?.data || e.message); }
   }
-
-  // REST path
   try {
-    // list associations
     const assocUrl = `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/deals`;
-    const assoc = await axios.get(assocUrl, {
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-    });
+    const assoc = await axios.get(assocUrl, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     const ids = (assoc.data?.results || []).map(r => r.toObjectId).filter(Boolean);
     if (!ids.length) return [];
-    // batch read
     const readUrl = 'https://api.hubapi.com/crm/v3/objects/deals/batch/read';
     const body = {
       properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
       inputs: ids.map(id => ({ id: String(id) }))
     };
-    const batch = await axios.post(readUrl, body, {
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-    });
+    const batch = await axios.post(readUrl, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     return batch.data?.results || [];
-  } catch (e) {
-    console.error('REST getDealsForContact error:', e.response?.data || e.message);
-    return [];
-  }
+  } catch (e) { console.error('REST getDealsForContact', e.response?.data || e.message); return []; }
 }
 
 async function hsSearchDealsByAddress(addressLike) {
   if (!addressLike) return [];
-  // SDK path
   if (hubspot) {
     try {
       const resp = await hubspot.crm.deals.searchApi.doSearch({
@@ -126,12 +101,8 @@ async function hsSearchDealsByAddress(addressLike) {
         limit: 5
       });
       return resp?.results || [];
-    } catch (e) {
-      console.error('SDK searchDealsByAddress error:', e.response?.data || e.message);
-      return [];
-    }
+    } catch (e) { console.error('SDK searchDealsByAddress', e.response?.data || e.message); }
   }
-  // REST path
   try {
     const url = 'https://api.hubapi.com/crm/v3/objects/deals/search';
     const body = {
@@ -139,14 +110,9 @@ async function hsSearchDealsByAddress(addressLike) {
       properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
       limit: 5
     };
-    const resp = await axios.post(url, body, {
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-    });
+    const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     return resp.data?.results || [];
-  } catch (e) {
-    console.error('REST searchDealsByAddress error:', e.response?.data || e.message);
-    return [];
-  }
+  } catch (e) { console.error('REST searchDealsByAddress', e.response?.data || e.message); return []; }
 }
 
 function buildLastSummary({ contact, deal }) {
@@ -172,6 +138,7 @@ function buildLastSummary({ contact, deal }) {
   return lines.filter(Boolean).join(' • ');
 }
 
+// ---------- Core builder ----------
 async function buildAssistantOverride(payload = {}) {
   const phone = payload.phone || payload.from || payload.callerPhone || '';
   const property_address = payload.property_address || payload.address || '';
@@ -209,7 +176,33 @@ async function buildAssistantOverride(payload = {}) {
       `Mind if I ask a couple quick questions so PG can review options?"`;
   }
 
-  return { assistantOverride: { variables: vars, instructions_append } };
+  // ---------- Voice override (env + per-request) ----------
+  const voiceOverride = {};
+  const reqVoiceName = payload.voice_name || payload.voiceName;
+  const reqStability = payload.voice_stability ?? payload.voiceStability;
+  const reqSimilarity = payload.voice_similarity ?? payload.voiceSimilarity;
+  const reqStyle = payload.voice_style || payload.voiceStyle;
+
+  const name = reqVoiceName || VOICE_NAME;
+  const stability = (reqStability !== undefined ? reqStability : VOICE_STABILITY);
+  const similarity = (reqSimilarity !== undefined ? reqSimilarity : VOICE_SIMILARITY);
+  const style = reqStyle || VOICE_STYLE;
+
+  if (name || stability !== '' || similarity !== '' || style) {
+    voiceOverride.provider = 'openai';
+    if (name) voiceOverride.name = String(name);
+    if (stability !== '') voiceOverride.stability = Number(stability);
+    if (similarity !== '') voiceOverride.similarity_boost = Number(similarity);
+    if (style) voiceOverride.style = String(style);
+  }
+
+  return {
+    assistantOverride: {
+      ...(Object.keys(voiceOverride).length ? { voice: voiceOverride } : {}),
+      variables: vars,
+      instructions_append
+    }
+  };
 }
 
 // ---------- Routes ----------
@@ -227,13 +220,17 @@ app.post('/assistant-request', handler);
 app.post('/webhook', handler);
 
 app.get('/health', (_, res) => res.send('ok'));
-
-// quick diagnostics endpoint
 app.get('/diag', (_, res) => {
   res.json({
     node: process.versions.node,
     hasHubSpotSDK: !!hubspot,
-    envHasToken: !!HUBSPOT_TOKEN
+    envHasToken: !!HUBSPOT_TOKEN,
+    voiceEnv: {
+      name: VOICE_NAME || null,
+      stability: VOICE_STABILITY || null,
+      similarity: VOICE_SIMILARITY || null,
+      style: VOICE_STYLE || null
+    }
   });
 });
 
