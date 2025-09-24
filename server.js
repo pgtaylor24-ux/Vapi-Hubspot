@@ -1,4 +1,4 @@
-// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override via env/request
+// server.js (ESM) – Vapi ↔ HubSpot bridge with voice override + /log notes
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -22,7 +22,7 @@ const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || '';
 if (!HUBSPOT_TOKEN) console.warn('[WARN] HUBSPOT_PRIVATE_APP_TOKEN is not set.');
 
 // Voice override (optional): set these in Render if you want global tuning
-const VOICE_NAME = process.env.VAPI_VOICE_NAME || '';                // e.g., "ash"
+const VOICE_NAME = process.env.VAPI_VOICE_NAME || '';                // e.g., "sage"
 const VOICE_STABILITY = process.env.VAPI_VOICE_STABILITY || '';      // e.g., "0.35"
 const VOICE_SIMILARITY = process.env.VAPI_VOICE_SIMILARITY || '';    // e.g., "0.85"
 const VOICE_STYLE = process.env.VAPI_VOICE_STYLE || '';              // e.g., "conversational, approachable, calm, short sentences"
@@ -205,6 +205,79 @@ async function buildAssistantOverride(payload = {}) {
   };
 }
 
+// ---------- Notes helpers ----------
+async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
+  // Create the note
+  let noteId = null;
+
+  // SDK path
+  if (hubspot) {
+    try {
+      const created = await hubspot.crm.notes.basicApi.create({
+        properties: { hs_note_body: body }
+      });
+      noteId = created?.id;
+    } catch (e) {
+      console.error('SDK create note error:', e.response?.data || e.message);
+    }
+    // Associate if created
+    try {
+      if (noteId && contactId) {
+        await hubspot.crm.notes.associationsApi.create(noteId, 'contacts', contactId, 'note_to_contact');
+      }
+      if (noteId && dealId) {
+        await hubspot.crm.notes.associationsApi.create(noteId, 'deals', dealId, 'note_to_deal');
+      }
+    } catch (e) {
+      console.error('SDK note association error:', e.response?.data || e.message);
+    }
+    return noteId;
+  }
+
+  // REST fallback
+  try {
+    const createUrl = 'https://api.hubapi.com/crm/v3/objects/notes';
+    const created = await axios.post(createUrl, {
+      properties: { hs_note_body: body }
+    }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    noteId = created?.data?.id;
+  } catch (e) {
+    console.error('REST create note error:', e.response?.data || e.message);
+  }
+  // Associate (REST v3 associations)
+  try {
+    if (noteId && contactId) {
+      const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`;
+      await axios.put(assocUrl, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    }
+    if (noteId && dealId) {
+      const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/deals/${dealId}/note_to_deal`;
+      await axios.put(assocUrl, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    }
+  } catch (e) {
+    console.error('REST note association error:', e.response?.data || e.message);
+  }
+  return noteId;
+}
+
+function buildNoteBody(payload = {}) {
+  // Payload can include: phone, property_address, city, state, motivation, timeline, price_feel, extras, outcome, next_step, scheduled_time, transcript
+  const parts = [];
+  if (payload.property_address || payload.city || payload.state) {
+    parts.push(`Property: ${[payload.property_address, payload.city, payload.state].filter(Boolean).join(', ')}`);
+  }
+  if (payload.motivation) parts.push(`Motivation: ${payload.motivation}`);
+  if (payload.timeline) parts.push(`Timeline: ${payload.timeline}`);
+  if (payload.price_feel) parts.push(`Price feel: ${payload.price_feel}`);
+  if (payload.extras) parts.push(`Facts: ${payload.extras}`);
+  if (payload.outcome) parts.push(`Outcome: ${payload.outcome}`);
+  if (payload.next_step) parts.push(`Next step: ${payload.next_step}`);
+  if (payload.scheduled_time) parts.push(`Scheduled: ${payload.scheduled_time}`);
+  if (payload.transcript) parts.push(`Transcript:\n${payload.transcript}`);
+  if (payload.phone) parts.push(`Phone: ${payload.phone}`);
+  return parts.join('\n');
+}
+
 // ---------- Routes ----------
 async function handler(req, res) {
   try {
@@ -216,9 +289,11 @@ async function handler(req, res) {
   }
 }
 
+// Called by Vapi: enrich variables/voice each call
 app.post('/assistant-request', handler);
 app.post('/webhook', handler);
 
+// Optional: health + diag
 app.get('/health', (_, res) => res.send('ok'));
 app.get('/diag', (_, res) => {
   res.json({
@@ -232,6 +307,38 @@ app.get('/diag', (_, res) => {
       style: VOICE_STYLE || null
     }
   });
+});
+
+// New: /log – write a HubSpot Note associated to contact (and first deal if found)
+app.post('/log', async (req, res) => {
+  try {
+    const p = req.body || {};
+    const phone = p.phone || p.from || p.callerPhone || '';
+    let contactId = null;
+    let dealId = null;
+
+    // Find contact by phone
+    const contacts = await hsSearchContactsByPhone(phone);
+    if (contacts.length) contactId = contacts[0].id;
+
+    // Try to find a deal by contact association or address
+    if (contactId) {
+      const deals = await hsGetDealsForContact(contactId);
+      if (deals?.length) dealId = deals[0].id;
+    }
+    if (!dealId && p.property_address) {
+      const dealsByAddr = await hsSearchDealsByAddress(p.property_address);
+      if (dealsByAddr?.length) dealId = dealsByAddr[0].id;
+    }
+
+    const body = buildNoteBody(p);
+    const noteId = await hsCreateNoteAndAssociate({ body, contactId, dealId });
+
+    res.json({ ok: true, noteId, contactId, dealId });
+  } catch (e) {
+    console.error('/log fatal:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
