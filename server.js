@@ -37,10 +37,20 @@ const get = (obj, path, fb = undefined) =>
 const normalizePhone = (raw = '') =>
   raw.replace(/[^\d+]/g, '').replace(/^1(\d{10})$/, '+1$1');
 
+// ---------- Enhanced logging ----------
+const log = (level, message, data = null) => {
+  const timestamp = new Date().toISOString();
+  const logData = data ? ` | Data: ${JSON.stringify(data, null, 2)}` : '';
+  console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}${logData}`);
+};
+
 // ---------- HubSpot helpers (SDK with REST fallback) ----------
 async function hsSearchContactsByPhone(phone) {
   const q = normalizePhone(phone);
   if (!q) return [];
+  
+  log('info', `Searching contacts for phone: ${q}`);
+  
   if (hubspot) {
     try {
       const resp = await hubspot.crm.contacts.searchApi.doSearch({
@@ -48,8 +58,11 @@ async function hsSearchContactsByPhone(phone) {
         properties: ['firstname','lastname','email','phone','address','city','state','zip'],
         limit: 5
       });
+      log('info', `SDK found ${resp.results?.length || 0} contacts`);
       return resp.results || [];
-    } catch (e) { console.error('SDK searchContactsByPhone', e.response?.data || e.message); }
+    } catch (e) { 
+      log('error', 'SDK searchContactsByPhone failed', e.response?.data || e.message);
+    }
   }
   try {
     const url = 'https://api.hubapi.com/crm/v3/objects/contacts/search';
@@ -59,40 +72,62 @@ async function hsSearchContactsByPhone(phone) {
       limit: 5
     };
     const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    log('info', `REST found ${resp.data?.results?.length || 0} contacts`);
     return resp.data?.results || [];
-  } catch (e) { console.error('REST searchContactsByPhone', e.response?.data || e.message); return []; }
+  } catch (e) { 
+    log('error', 'REST searchContactsByPhone failed', e.response?.data || e.message);
+    return []; 
+  }
 }
 
 async function hsGetDealsForContact(contactId) {
+  log('info', `Getting deals for contact: ${contactId}`);
+  
   if (hubspot) {
     try {
       const assoc = await hubspot.crm.contacts.associationsApi.getAll('contacts', contactId, 'deals');
       const ids = (assoc?.results || []).map(r => r.to?.id).filter(Boolean);
-      if (!ids.length) return [];
+      if (!ids.length) {
+        log('info', 'No deals found for contact');
+        return [];
+      }
       const batch = await hubspot.crm.deals.batchApi.read({
         inputs: ids.map(id => ({ id })),
         properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation']
       });
+      log('info', `SDK found ${batch?.results?.length || 0} deals`);
       return batch?.results || [];
-    } catch (e) { console.error('SDK getDealsForContact', e.response?.data || e.message); }
+    } catch (e) { 
+      log('error', 'SDK getDealsForContact failed', e.response?.data || e.message);
+    }
   }
   try {
     const assocUrl = `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/deals`;
     const assoc = await axios.get(assocUrl, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     const ids = (assoc.data?.results || []).map(r => r.toObjectId).filter(Boolean);
-    if (!ids.length) return [];
+    if (!ids.length) {
+      log('info', 'No deals found for contact');
+      return [];
+    }
     const readUrl = 'https://api.hubapi.com/crm/v3/objects/deals/batch/read';
     const body = {
       properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
       inputs: ids.map(id => ({ id: String(id) }))
     };
     const batch = await axios.post(readUrl, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    log('info', `REST found ${batch.data?.results?.length || 0} deals`);
     return batch.data?.results || [];
-  } catch (e) { console.error('REST getDealsForContact', e.response?.data || e.message); return []; }
+  } catch (e) { 
+    log('error', 'REST getDealsForContact failed', e.response?.data || e.message);
+    return []; 
+  }
 }
 
 async function hsSearchDealsByAddress(addressLike) {
   if (!addressLike) return [];
+  
+  log('info', `Searching deals by address: ${addressLike}`);
+  
   if (hubspot) {
     try {
       const resp = await hubspot.crm.deals.searchApi.doSearch({
@@ -100,8 +135,11 @@ async function hsSearchDealsByAddress(addressLike) {
         properties: ['dealname','amount','address','city','state','zip','property_type','asking_price','timeline','motivation'],
         limit: 5
       });
+      log('info', `SDK found ${resp?.results?.length || 0} deals by address`);
       return resp?.results || [];
-    } catch (e) { console.error('SDK searchDealsByAddress', e.response?.data || e.message); }
+    } catch (e) { 
+      log('error', 'SDK searchDealsByAddress failed', e.response?.data || e.message);
+    }
   }
   try {
     const url = 'https://api.hubapi.com/crm/v3/objects/deals/search';
@@ -111,8 +149,12 @@ async function hsSearchDealsByAddress(addressLike) {
       limit: 5
     };
     const resp = await axios.post(url, body, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    log('info', `REST found ${resp.data?.results?.length || 0} deals by address`);
     return resp.data?.results || [];
-  } catch (e) { console.error('REST searchDealsByAddress', e.response?.data || e.message); return []; }
+  } catch (e) { 
+    log('error', 'REST searchDealsByAddress failed', e.response?.data || e.message);
+    return []; 
+  }
 }
 
 function buildLastSummary({ contact, deal }) {
@@ -146,6 +188,8 @@ async function buildAssistantOverride(payload = {}) {
   const state = payload.state || '';
   const caller_name = payload.caller_name || payload.name || '';
 
+  log('info', 'Building assistant override', { phone, property_address, city, state, caller_name });
+
   let contact = null, deals = [], deal = null;
 
   const contacts = await hsSearchContactsByPhone(phone);
@@ -160,20 +204,25 @@ async function buildAssistantOverride(payload = {}) {
 
   const vars = {
     seller_first_name: caller_name || get(contact, 'properties.firstname', '') || '',
+    name: caller_name || get(contact, 'properties.firstname', '') || '',
     property_address: get(deal, 'properties.address', '') || property_address || '',
+    propertyAddress: get(deal, 'properties.address', '') || property_address || '',
     city: get(deal, 'properties.city', '') || city || '',
     state: get(deal, 'properties.state', '') || state || '',
     last_summary: buildLastSummary({ contact, deal })
   };
 
+  log('info', 'Generated variables', vars);
+
+  // Enhanced opening instructions with more natural flow
   let instructions_append = '';
   if (vars.property_address || vars.last_summary) {
     instructions_append =
-      `OPEN LIKE THIS (adjust naturally): "Hey ${vars.seller_first_name || ''}, ` +
-      `thanks for taking the time about ${vars.property_address || 'your property'}` +
-      `${vars.city ? ' in ' + vars.city : ''}. ` +
-      `${vars.last_summary ? 'Quick heads up: ' + vars.last_summary + '. ' : ''}` +
-      `Mind if I ask a couple quick questions so PG can review options?"`;
+      `OPEN LIKE THIS (adjust naturally): "Hi ${vars.seller_first_name ? vars.seller_first_name + ', ' : ''}` +
+      `this is Alex with Taylor Real Estate Group. I'm calling about ${vars.property_address || 'your property'}` +
+      `${vars.city ? ' in ' + vars.city : ''}. Did I catch you at an okay moment?" ` +
+      `${vars.last_summary ? 'Previous context: ' + vars.last_summary + '. ' : ''}` +
+      `Keep the conversation flowing naturally - don't just read this word for word.`;
   }
 
   // ---------- Voice override (env + per-request) ----------
@@ -196,17 +245,22 @@ async function buildAssistantOverride(payload = {}) {
     if (style) voiceOverride.style = String(style);
   }
 
-  return {
+  const response = {
     assistantOverride: {
       ...(Object.keys(voiceOverride).length ? { voice: voiceOverride } : {}),
       variables: vars,
       instructions_append
     }
   };
+
+  log('info', 'Final assistant override response', response);
+  return response;
 }
 
 // ---------- Notes helpers ----------
 async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
+  log('info', 'Creating note', { contactId, dealId, bodyLength: body?.length });
+  
   // Create the note
   let noteId = null;
 
@@ -217,19 +271,22 @@ async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
         properties: { hs_note_body: body }
       });
       noteId = created?.id;
+      log('info', `SDK created note: ${noteId}`);
     } catch (e) {
-      console.error('SDK create note error:', e.response?.data || e.message);
+      log('error', 'SDK create note failed', e.response?.data || e.message);
     }
     // Associate if created
     try {
       if (noteId && contactId) {
         await hubspot.crm.notes.associationsApi.create(noteId, 'contacts', contactId, 'note_to_contact');
+        log('info', `Associated note ${noteId} to contact ${contactId}`);
       }
       if (noteId && dealId) {
         await hubspot.crm.notes.associationsApi.create(noteId, 'deals', dealId, 'note_to_deal');
+        log('info', `Associated note ${noteId} to deal ${dealId}`);
       }
     } catch (e) {
-      console.error('SDK note association error:', e.response?.data || e.message);
+      log('error', 'SDK note association failed', e.response?.data || e.message);
     }
     return noteId;
   }
@@ -241,51 +298,70 @@ async function hsCreateNoteAndAssociate({ body, contactId, dealId }) {
       properties: { hs_note_body: body }
     }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     noteId = created?.data?.id;
+    log('info', `REST created note: ${noteId}`);
   } catch (e) {
-    console.error('REST create note error:', e.response?.data || e.message);
+    log('error', 'REST create note failed', e.response?.data || e.message);
   }
   // Associate (REST v3 associations)
   try {
     if (noteId && contactId) {
       const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`;
       await axios.put(assocUrl, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+      log('info', `Associated note ${noteId} to contact ${contactId}`);
     }
     if (noteId && dealId) {
       const assocUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/deals/${dealId}/note_to_deal`;
       await axios.put(assocUrl, {}, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+      log('info', `Associated note ${noteId} to deal ${dealId}`);
     }
   } catch (e) {
-    console.error('REST note association error:', e.response?.data || e.message);
+    log('error', 'REST note association failed', e.response?.data || e.message);
   }
   return noteId;
 }
 
 function buildNoteBody(payload = {}) {
-  // Payload can include: phone, property_address, city, state, motivation, timeline, price_feel, extras, outcome, next_step, scheduled_time, transcript
+  // Enhanced note formatting with better structure
   const parts = [];
+  const timestamp = new Date().toLocaleString();
+  parts.push(`Call Summary - ${timestamp}`);
+  parts.push('---');
+  
   if (payload.property_address || payload.city || payload.state) {
     parts.push(`Property: ${[payload.property_address, payload.city, payload.state].filter(Boolean).join(', ')}`);
   }
   if (payload.motivation) parts.push(`Motivation: ${payload.motivation}`);
   if (payload.timeline) parts.push(`Timeline: ${payload.timeline}`);
   if (payload.price_feel) parts.push(`Price feel: ${payload.price_feel}`);
-  if (payload.extras) parts.push(`Facts: ${payload.extras}`);
-  if (payload.outcome) parts.push(`Outcome: ${payload.outcome}`);
+  if (payload.extras) parts.push(`Additional facts: ${payload.extras}`);
+  if (payload.outcome) parts.push(`Call outcome: ${payload.outcome}`);
   if (payload.next_step) parts.push(`Next step: ${payload.next_step}`);
-  if (payload.scheduled_time) parts.push(`Scheduled: ${payload.scheduled_time}`);
-  if (payload.transcript) parts.push(`Transcript:\n${payload.transcript}`);
+  if (payload.scheduled_time) parts.push(`Follow-up scheduled: ${payload.scheduled_time}`);
   if (payload.phone) parts.push(`Phone: ${payload.phone}`);
+  
+  if (payload.transcript) {
+    parts.push('---');
+    parts.push('Full Transcript:');
+    parts.push(payload.transcript);
+  }
+  
   return parts.join('\n');
 }
 
 // ---------- Routes ----------
 async function handler(req, res) {
   try {
+    log('info', `Handling ${req.method} ${req.path}`, req.body);
     const override = await buildAssistantOverride(req.body || {});
     res.json(override);
   } catch (e) {
-    console.error('assistant handler fatal:', e);
-    res.status(200).json({ assistantOverride: { variables: {}, instructions_append: '' }});
+    log('error', 'Handler fatal error', e);
+    res.status(200).json({ 
+      assistantOverride: { 
+        variables: {}, 
+        instructions_append: '' 
+      }
+    });
   }
 }
 
@@ -296,7 +372,8 @@ app.post('/webhook', handler);
 // Optional: health + diag
 app.get('/health', (_, res) => res.send('ok'));
 app.get('/diag', (_, res) => {
-  res.json({
+  const diagnostics = {
+    timestamp: new Date().toISOString(),
     node: process.versions.node,
     hasHubSpotSDK: !!hubspot,
     envHasToken: !!HUBSPOT_TOKEN,
@@ -306,12 +383,16 @@ app.get('/diag', (_, res) => {
       similarity: VOICE_SIMILARITY || null,
       style: VOICE_STYLE || null
     }
-  });
+  };
+  log('info', 'Diagnostics requested', diagnostics);
+  res.json(diagnostics);
 });
 
-// New: /log – write a HubSpot Note associated to contact (and first deal if found)
+// Enhanced /log endpoint with better error handling
 app.post('/log', async (req, res) => {
   try {
+    log('info', 'Processing log request', req.body);
+    
     const p = req.body || {};
     const phone = p.phone || p.from || p.callerPhone || '';
     let contactId = null;
@@ -334,12 +415,26 @@ app.post('/log', async (req, res) => {
     const body = buildNoteBody(p);
     const noteId = await hsCreateNoteAndAssociate({ body, contactId, dealId });
 
-    res.json({ ok: true, noteId, contactId, dealId });
+    const response = { ok: true, noteId, contactId, dealId };
+    log('info', 'Log request completed successfully', response);
+    res.json(response);
   } catch (e) {
-    console.error('/log fatal:', e);
+    log('error', 'Log request failed', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Assistant webhook running on :' + PORT));
+app.listen(PORT, () => {
+  log('info', `Assistant webhook running on port ${PORT}`);
+  log('info', 'Server configuration', {
+    hasHubSpotToken: !!HUBSPOT_TOKEN,
+    hasHubSpotSDK: !!hubspot,
+    voiceOverrides: {
+      name: VOICE_NAME || 'default',
+      stability: VOICE_STABILITY || 'default',
+      similarity: VOICE_SIMILARITY || 'default',
+      style: VOICE_STYLE || 'default'
+    }
+  });
+});
