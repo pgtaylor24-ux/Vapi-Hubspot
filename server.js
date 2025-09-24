@@ -212,18 +212,21 @@ async function buildAssistantOverride(payload = {}) {
     last_summary: buildLastSummary({ contact, deal })
   };
 
+  // === Patch #1: safe greeting variables so we never speak blanks ===
+  vars.display_name = vars.seller_first_name || 'there';
+  vars.display_property = vars.property_address
+    ? `${vars.property_address}${vars.city ? ', ' + vars.city : ''}${vars.state ? ', ' + vars.state : ''}`
+    : 'your property';
+
   log('info', 'Generated variables', vars);
 
-  // Enhanced opening instructions with more natural flow
+  // === Patch #3: improved dynamic opener using safe vars ===
   let instructions_append = '';
-  if (vars.property_address || vars.last_summary) {
-    instructions_append =
-      `OPEN LIKE THIS (adjust naturally): "Hi ${vars.seller_first_name ? vars.seller_first_name + ', ' : ''}` +
-      `this is Alex with Taylor Real Estate Group. I'm calling about ${vars.property_address || 'your property'}` +
-      `${vars.city ? ' in ' + vars.city : ''}. Did I catch you at an okay moment?" ` +
-      `${vars.last_summary ? 'Previous context: ' + vars.last_summary + '. ' : ''}` +
-      `Keep the conversation flowing naturally - don't just read this word for word.`;
-  }
+  instructions_append =
+    `OPEN LIKE THIS (adjust naturally): "Hi ${vars.display_name}, this is Alex with Taylor Real Estate Group. ` +
+    `I'm calling about ${vars.display_property}. Did I catch you at an okay moment?" ` +
+    `${vars.last_summary ? 'Previous context: ' + vars.last_summary + '. ' : ''}` +
+    `Keep it human. One question at a time. Vary acknowledgments (okay / makes sense / thanks). Avoid saying 'Got it'.`;
 
   // ---------- Voice override (env + per-request) ----------
   const voiceOverride = {};
@@ -237,9 +240,13 @@ async function buildAssistantOverride(payload = {}) {
   const similarity = (reqSimilarity !== undefined ? reqSimilarity : VOICE_SIMILARITY);
   const style = reqStyle || VOICE_STYLE;
 
+  // === Patch #2: set both name and voiceId for compatibility across tenants ===
   if (name || stability !== '' || similarity !== '' || style) {
     voiceOverride.provider = 'openai';
-    if (name) voiceOverride.name = String(name);
+    if (name) {
+      voiceOverride.name = String(name);        // e.g., "sage"
+      voiceOverride.voiceId = String(name);     // some tenants expect voiceId
+    }
     if (stability !== '') voiceOverride.stability = Number(stability);
     if (similarity !== '') voiceOverride.similarity_boost = Number(similarity);
     if (style) voiceOverride.style = String(style);
