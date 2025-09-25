@@ -1,21 +1,21 @@
-// server.js (CommonJS, ready for Render/Node >=16)
-// - PATCH Vapi assistant on boot to enable barge-in / streaming
-// - Assistant-request webhook injects HubSpot context by caller phone
-// - Minimal, robust, and easy to extend
+// server.js (ESM, works with "type": "module")
+// - Patches Vapi assistant (barge-in, partial ASR, VAD, low-latency) on boot and via /admin/update-assistant
+// - Assistant-request webhook uses HubSpot to inject {{last_summary}} and {{property_street}} per call
 
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
-const dotenv = require("dotenv");
+import express from "express";
+import bodyParser from "body-parser";
+import axios from "axios";
+import dotenv from "dotenv";
 dotenv.config();
 
 const {
-  PORT = 8080,
+  PORT = process.env.PORT || 8080,
   VAPI_API_KEY,
   VAPI_ASSISTANT_ID,
   HUBSPOT_ACCESS_TOKEN
 } = process.env;
 
+// Early env validation
 if (!VAPI_API_KEY) {
   console.error("❌ Missing VAPI_API_KEY in env.");
   process.exit(1);
@@ -25,13 +25,13 @@ if (!VAPI_ASSISTANT_ID) {
   process.exit(1);
 }
 if (!HUBSPOT_ACCESS_TOKEN) {
-  console.warn("⚠️  Missing HUBSPOT_ACCESS_TOKEN — HubSpot lookups will be skipped.");
+  console.warn("⚠️  HUBSPOT_ACCESS_TOKEN not set — CRM context will be limited.");
 }
 
 const app = express();
 app.use(bodyParser.json());
 
-// ---------------- Assistant overlay (applied via PATCH) ----------------
+// ---------------- Assistant overlay to enforce real-time behavior ----------------
 const assistantOverlay = {
   bargeIn: {
     enabled: true,
@@ -40,7 +40,7 @@ const assistantOverlay = {
   },
   transcription: {
     provider: "openai",                 // or "deepgram"
-    model: "gpt-4o-mini-transcribe",
+    model: "gpt-4o-mini-transcribe",    // streaming ASR
     partialResults: true,
     punctuate: true,
     smartFormat: true,
@@ -59,7 +59,7 @@ const assistantOverlay = {
   },
   latency: { mode: "low" },
   tts: {
-    provider: "elevenlabs",
+    provider: "elevenlabs",             // or your current TTS provider
     interruptOnVoice: true,             // critical for instant cutoffs
     maxUtteranceMs: 3500,
     normalizePunctuation: true
@@ -74,7 +74,7 @@ const assistantOverlay = {
     suppressFillers: true,
     maxSentencesPerReply: 2
   },
-  // Short, permission-based opener (optional to keep here; you can remove if set in Vapi)
+  // Optional opener + prompt (remove if you prefer to manage inside Vapi)
   firstMessage:
     "Hi, this is Alex with Taylor Real Estate Group. I'm calling about your property on {{property_street}}. Did I catch you at an okay time?",
   prompt:
@@ -83,6 +83,7 @@ const assistantOverlay = {
     "Keep replies short (max 2 sentences), one idea per reply. If bad time, offer to reschedule."
 };
 
+// --- PATCH your assistant to apply overlay
 async function patchAssistantOverlay() {
   const url = `https://api.vapi.ai/v1/assistants/${encodeURIComponent(VAPI_ASSISTANT_ID)}`;
   const headers = {
@@ -90,8 +91,7 @@ async function patchAssistantOverlay() {
     "Content-Type": "application/json"
   };
   const body = { assistant: assistantOverlay };
-
-  const { data } = await axios.patch(url, body, { headers, timeout: 15000 });
+  const { data } = await axios.patch(url, body, { headers, timeout: 20000 });
   return data;
 }
 
@@ -101,35 +101,23 @@ const hs = axios.create({
   headers: HUBSPOT_ACCESS_TOKEN
     ? { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}` }
     : {},
-  timeout: 15000
+  timeout: 20000
 });
 
-/**
- * Normalize E.164 or raw PSTN numbers (keep digits and '+')
- */
 function normalizePhone(raw) {
   if (!raw) return null;
   const trimmed = String(raw).trim();
-  if (!trimmed) return null;
-  // If it already looks like E.164 (+1...), keep it.
-  if (/^\+\d{7,15}$/.test(trimmed)) return trimmed;
-  // Otherwise, strip non-digits, prepend +1 if US-length
+  if (/^\+\d{7,15}$/.test(trimmed)) return trimmed;      // already E.164
   const digits = trimmed.replace(/[^\d]/g, "");
   if (!digits) return null;
-  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 10) return `+1${digits}`;        // assume US
   if (digits.length >= 11 && digits.length <= 15) return `+${digits}`;
   return null;
 }
 
-/**
- * Find a HubSpot contact by phone (tries query-based search).
- * Falls back to last-contacted if multiple matches.
- */
 async function findContactByPhone(phoneE164) {
   if (!HUBSPOT_ACCESS_TOKEN || !phoneE164) return null;
-
   try {
-    // HubSpot Search API (simple q= search)
     const url = `/crm/v3/objects/contacts/search`;
     const body = {
       q: phoneE164,
@@ -149,40 +137,26 @@ async function findContactByPhone(phoneE164) {
         "address"
       ],
       limit: 5,
-      sort: [
-        { propertyName: "hs_lastcontacted", direction: "DESCENDING" }
-      ]
+      sort: [{ propertyName: "hs_lastcontacted", direction: "DESCENDING" }]
     };
-
     const { data } = await hs.post(url, body);
     const results = data?.results || [];
     if (!results.length) return null;
-
-    // Pick top result (most recently contacted)
     const top = results[0];
-    return {
-      id: top.id,
-      properties: top.properties || {}
-    };
+    return { id: top.id, properties: top.properties || {} };
   } catch (err) {
     console.warn("HubSpot search error:", err?.response?.data || err.message);
     return null;
   }
 }
 
-/**
- * Optional: get deals associated with a contact (basic snapshot).
- */
 async function getDealsForContact(contactId) {
   if (!HUBSPOT_ACCESS_TOKEN || !contactId) return [];
-
   try {
-    // list deal associations (contact -> deals)
     const assocUrl = `/crm/v4/objects/contacts/${contactId}/associations/deals`;
     const { data } = await hs.get(assocUrl);
     const ids = (data?.results || []).map(r => r.toObjectId).slice(0, 5);
     if (!ids.length) return [];
-
     const dealUrl = `/crm/v3/objects/deals/batch/read`;
     const body = {
       properties: ["dealname", "amount", "dealstage", "closedate", "pipeline"],
@@ -199,25 +173,19 @@ async function getDealsForContact(contactId) {
   }
 }
 
-/**
- * Build a short one-liner last_summary from HubSpot fields (safe + concise).
- */
 function buildLastSummary(contact, deals) {
   if (!contact) return null;
   const p = contact.properties || {};
-  const name =
-    [p.firstname, p.lastname].filter(Boolean).join(" ") || "the owner";
+  const name = [p.firstname, p.lastname].filter(Boolean).join(" ") || "the owner";
   const status = p.hs_lead_status ? `status ${p.hs_lead_status}` : null;
   const stage = p.lifecyclestage ? `stage ${p.lifecyclestage}` : null;
-
-  const lastContact =
-    p.hs_lastcontacted
-      ? new Date(p.hs_lastcontacted).toLocaleDateString()
-      : null;
-
-  const dealSnippet = deals && deals.length
-    ? `Recent deal: ${deals[0].dealname || "—"} (${deals[0].dealstage || "stage unknown"})`
+  const lastContact = p.hs_lastcontacted
+    ? new Date(p.hs_lastcontacted).toLocaleDateString()
     : null;
+  const dealSnippet =
+    deals && deals.length
+      ? `Recent deal: ${deals[0].dealname || "—"} (${deals[0].dealstage || "stage unknown"})`
+      : null;
 
   const bits = [];
   bits.push(`Spoke with ${name}${lastContact ? ` (last contact ${lastContact})` : ""}.`);
@@ -227,29 +195,24 @@ function buildLastSummary(contact, deals) {
 }
 
 // ---------------- Routes ----------------
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString() });
-});
+app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// Force re-apply assistant overlay any time
 app.post("/admin/update-assistant", async (_req, res) => {
   try {
     const data = await patchAssistantOverlay();
     res.json({ ok: true, assistant_id: VAPI_ASSISTANT_ID, data });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: String(err?.response?.data || err.message) });
+    res
+      .status(500)
+      .json({ ok: false, error: String(err?.response?.data || err.message) });
   }
 });
 
-// Quick local test of HubSpot search: GET /admin/test-hubspot?phone=+16158397260
 app.get("/admin/test-hubspot", async (req, res) => {
   try {
-    const raw = req.query.phone;
-    const phone = normalizePhone(raw);
-    if (!phone) {
-      return res.status(400).json({ ok: false, error: "Provide ?phone=E164 or raw." });
-    }
+    const phone = normalizePhone(req.query.phone);
+    if (!phone) return res.status(400).json({ ok: false, error: "Provide ?phone=E164 or raw." });
     const contact = await findContactByPhone(phone);
     const deals = contact ? await getDealsForContact(contact.id) : [];
     const last_summary = buildLastSummary(contact, deals) || "No prior context in CRM.";
@@ -259,12 +222,10 @@ app.get("/admin/test-hubspot", async (req, res) => {
   }
 });
 
-// ----- Vapi Assistant Request Webhook -----
-// Configure in Vapi: Assistant → Webhooks → Assistant Request
-// Vapi will POST here BEFORE the call starts. We return assistant overrides + variables.
+// ---- Vapi Assistant Request Webhook ----
+// Configure this in Vapi: Assistant → Webhooks → Assistant Request (POST)
 app.post("/webhooks/vapi/assistant-request", async (req, res) => {
   try {
-    // Vapi payload shape can vary—collect best-effort fields.
     const metadata = req.body?.metadata || {};
     const callerNumber =
       req.body?.caller?.number ||
@@ -286,13 +247,9 @@ app.post("/webhooks/vapi/assistant-request", async (req, res) => {
       if (built) last_summary = built;
     }
 
-    // Optionally, keep responses extra concise on first turn
+    // Per-call override (keeps overlay settings applied by PATCH)
     const assistantOverrides = {
-      variables: {
-        property_street,
-        last_summary
-      },
-      // You can tweak the firstMessage per-call without losing the overlay set via PATCH
+      variables: { property_street, last_summary },
       firstMessage:
         "Hi, this is Alex with Taylor Real Estate Group. I'm calling about your property on {{property_street}}. Did I catch you at an okay time?"
     };
@@ -300,12 +257,11 @@ app.post("/webhooks/vapi/assistant-request", async (req, res) => {
     return res.json({ ok: true, assistant: assistantOverrides });
   } catch (err) {
     console.error("assistant-request webhook error:", err);
-    // Fail open: let Vapi proceed without overrides if our webhook has trouble
-    return res.json({ ok: true });
+    return res.json({ ok: true }); // fail-open
   }
 });
 
-// ---------------- Boot: apply overlay now ----------------
+// -------------- Boot: apply overlay now --------------
 (async function boot() {
   try {
     console.log("⏳ Applying Vapi barge-in/streaming overlay …");
@@ -320,5 +276,5 @@ app.post("/webhooks/vapi/assistant-request", async (req, res) => {
 })();
 
 app.listen(PORT, () => {
-  console.log(`🚀 server listening on http://localhost:${PORT}`);
+  console.log(`🚀 server listening on http://0.0.0.0:${PORT}`);
 });
